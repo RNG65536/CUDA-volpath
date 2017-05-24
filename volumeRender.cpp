@@ -22,7 +22,6 @@ typedef unsigned char uchar;
 
 const char *sSDKsample = "CUDA 3D Volume Render";
 
-const char *volumeFilename = "Bucky.raw";
 cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
 typedef unsigned char VolumeType;
 
@@ -85,6 +84,7 @@ public:
     }
 };
 
+template <typename T>
 class PboResource
 {
     struct cudaGraphicsResource *cuda_pbo_resource; // CUDA Graphics Resource (to transfer PBO)
@@ -105,9 +105,9 @@ public:
         // unregister this buffer object from CUDA C
         checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo_resource));
     }
-    float4 *map()
+    T *map()
     {
-        float4 *d_output;
+        T *d_output;
         // map PBO to get CUDA device pointer
         checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, 0));
         size_t num_bytes;
@@ -127,7 +127,7 @@ public:
 //////////////////////////////////////////////////////////////////////////
 
 SdkTimer timer;
-PboResource *resource = nullptr;
+PboResource<float4> *resource = nullptr;
 Param P;
 
 class CudaFrameBuffer
@@ -452,7 +452,7 @@ void initPixelBuffer()
     glBufferData(GL_PIXEL_UNPACK_BUFFER, P.width * P.height * sizeof(GLfloat) * 4, 0, GL_STREAM_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    resource = new PboResource(pbo);
+    resource = new PboResource<float4>(pbo);
     fb = new CudaFrameBuffer(P.width, P.height);
 
     // create texture for display
@@ -491,7 +491,7 @@ int main(int argc, char **argv)
     P.width = 512;
     P.height = 512;
     P.albedo = 1.0f;
-    P.g = 0.877f;
+    P.g = 0; //  0.877f;
 
     //start logs
     printf("%s Starting...\n\n", sSDKsample);
@@ -510,16 +510,7 @@ int main(int argc, char **argv)
         exit(EXIT_SUCCESS);
     }
 
-    // load volume data
-    char *path = sdkFindFilePath(volumeFilename, argv[0]);
-    if (path == 0)
-    {
-        printf("Error finding file '%s'\n", volumeFilename);
-        exit(EXIT_FAILURE);
-    }
-
-    size_t size = volumeSize.width * volumeSize.height * volumeSize.depth * sizeof(VolumeType);
-    void *h_volume = loadRawFile(path, size);
+    void *h_volume = new VolumeType[volumeSize.width * volumeSize.height * volumeSize.depth];
 
     init_cuda(h_volume, volumeSize);
     free(h_volume);
