@@ -1,0 +1,7 @@
+*.suo
+Release/
+*.ppm
+*.hdr
+.vs/
+_build/
+*.bat
