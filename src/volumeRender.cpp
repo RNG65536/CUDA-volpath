@@ -14,18 +14,48 @@ using std::endl;
 #include <vector_functions.h>
 #include <helper_cuda.h>
 #include <helper_timer.h>
+#include <random>
+#include <chrono>
 
 #include "param.h"
+
+#if USE_OPENVDB
+#include <load_vdb.h>
+#endif
 
 typedef unsigned int uint;
 typedef unsigned char uchar;
 
-const char *sSDKsample = "CUDA 3D Volume Render";
+static std::default_random_engine rng;
+static std::uniform_real_distribution<float> dist;
+static float randf()
+{
+    return dist(rng);
+}
 
-cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
+class Timer
+{
+private:
+    std::chrono::high_resolution_clock::time_point last;
+
+public:
+    Timer() { record(); }
+
+    void record() { last = std::chrono::high_resolution_clock::now(); }
+
+    float elapsed() const
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::high_resolution_clock::now() - last)
+            .count();
+    }
+};
+
+const char* sSDKsample = "CUDA 3D Volume Render";
+
 typedef unsigned char VolumeType;
 
-dim3 blockSize(16, 16);
+dim3 blockSize(8, 8);
 dim3 gridSize;
 
 bool linearFiltering = true;
@@ -33,17 +63,24 @@ bool linearFiltering = true;
 GLuint pbo = 0;     // OpenGL pixel buffer object
 GLuint tex = 0;     // OpenGL texture object
 
-float3 viewRotation = make_float3(20, -20, 0);
-float3 viewTranslation = make_float3(0.0, 0.0, -4.0f);
+//float3 viewRotation = make_float3(20, -20, 0);
+//float3 viewTranslation = make_float3(0.0, 0.0, -4.0f);
+float3 viewRotation    = make_float3(-12, -90, 0);
+float3 viewTranslation = make_float3(0.03, -0.05, -4.0);
 
-extern "C" void set_texture_filter_mode(bool bLinearFilter);
-extern "C" void init_cuda(void *h_volume, cudaExtent volumeSize);
-extern "C" void free_cuda_buffers();
 extern "C" void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, const Param& p);
 extern "C" void copy_inv_view_matrix(float *invViewMatrix, size_t sizeofMatrix);
 extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height);
 extern "C" void free_rng();
 extern "C" void scale(float4 *dst, float4 *src, int size, float scale);
+extern "C" void gamma_correct(float4 *dst, float4 *src, int size, float scale, float gamma);
+
+namespace TextureVolume
+{
+extern "C" void init_cuda(void *h_volume, cudaExtent volumeSize);
+extern "C" void set_texture_filter_mode(bool bLinearFilter);
+extern "C" void free_cuda_buffers();
+}
 
 void initPixelBuffer();
 
@@ -141,13 +178,19 @@ public:
     {
         width = w;
         height = h;
-        checkCudaErrors(cudaMallocManaged((void**)&sum_buffer, width * height * sizeof(float4)));
+        checkCudaErrors(cudaMalloc((void**)&sum_buffer, width * height * sizeof(float4)));
         // clear image
         checkCudaErrors(cudaMemset(sum_buffer, 0, width * height * sizeof(float4)));
     }
     ~CudaFrameBuffer()
     {
         checkCudaErrors(cudaFree(sum_buffer));
+    }
+    void reset()
+    {
+        spp = 0;
+        // clear image
+        checkCudaErrors(cudaMemset(sum_buffer, 0, width * height * sizeof(float4)));
     }
     float4 *ptr()
     {
@@ -160,6 +203,10 @@ public:
     void scaledOutput(float4 *dst)
     {
         scale(dst, sum_buffer, width * height, 1.0f / spp);
+    }
+    void gammaCorrectedOutput(float4 *dst, float gamma)
+    {
+        gamma_correct(dst, sum_buffer, width * height, 1.0f / spp, gamma);
     }
     int samplesPerPixel() const
     {
@@ -201,8 +248,7 @@ void cuda_volpath()
     model = glm::rotate(model, glm::radians(-viewRotation.y), glm::vec3(0.0, 1.0, 0.0));
     model = glm::rotate(model, glm::radians(-viewRotation.x), glm::vec3(1.0, 0.0, 0.0));
     model = glm::translate(model, glm::vec3(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z));
-//     model = glm::inverse(model);
-    model = glm::transpose(model);
+    model = glm::transpose(model); // build row major
 
     copy_inv_view_matrix(glm::value_ptr(model), sizeof(float4)*3);
 
@@ -210,9 +256,15 @@ void cuda_volpath()
     float4 *d_output = resource->map();
 
     // call CUDA kernel, writing results to PBO
+    Timer timer;
     render_kernel(gridSize, blockSize, fb->ptr(), P);
+    checkCudaErrors(cudaDeviceSynchronize());
+    float elapsed = timer.elapsed();
+    printf("%f M samples / s, %d x %d, %f\n", (float)P.width * (float)P.height / elapsed, P.width, P.height, elapsed);
+
     fb->incrementSPP();
-    fb->scaledOutput(d_output);
+    //fb->scaledOutput(d_output);
+    fb->gammaCorrectedOutput(d_output, 2.2f);
 
     getLastCudaError("kernel failed");
 
@@ -280,7 +332,7 @@ void keyboard(unsigned char key, int x, int y)
 
         case 'f':
             linearFiltering = !linearFiltering;
-            set_texture_filter_mode(linearFiltering);
+            TextureVolume::set_texture_filter_mode(linearFiltering);
             break;
 
         case '+':
@@ -329,8 +381,7 @@ void keyboard(unsigned char key, int x, int y)
     printf("albedo = %.2f, g = %.2f\n", P.albedo, P.g);
     glutPostRedisplay();
 
-    delete fb;
-    fb = new CudaFrameBuffer(P.width, P.height);
+    fb->reset();
 }
 
 int ox, oy;
@@ -354,20 +405,22 @@ void mouse(int button, int state, int x, int y)
 
 void motion(int x, int y)
 {
+    if (x == ox && y == oy) return;
+
     float dx, dy;
     dx = (float)(x - ox);
     dy = (float)(y - oy);
 
     if (buttonState == 4)
     {
-        // right = zoom
-        viewTranslation.z += dy / 100.0f;
-    }
-    else if (buttonState == 2)
-    {
         // middle = translate
         viewTranslation.x += dx / 100.0f;
         viewTranslation.y -= dy / 100.0f;
+    }
+    else if (buttonState == 2)
+    {
+        // right = zoom
+        viewTranslation.z += dy / 100.0f;
     }
     else if (buttonState == 1)
     {
@@ -380,8 +433,7 @@ void motion(int x, int y)
     oy = y;
     glutPostRedisplay();
 
-    delete fb;
-    fb = new CudaFrameBuffer(P.width, P.height);
+    fb->reset();
 }
 
 int divideUp(int a, int b)
@@ -407,13 +459,15 @@ void reshape(int w, int h)
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0.5 - float(P.width) / float(P.height) / 2,
-            0.5 + float(P.width) / float(P.height) / 2, 0.0, 1.0, 0.0, 1.0);
+    glOrtho(0.0, 1.0, 0.0, 1.0, 0.0, 1.0);
+
+    delete fb;
+    fb = new CudaFrameBuffer(P.width, P.height);
 }
 
 void cleanup()
 {
-    free_cuda_buffers();
+    TextureVolume::free_cuda_buffers();
     free_rng();
 
     if (pbo)
@@ -472,7 +526,7 @@ void *loadRawFile(char *filename, size_t size)
     if (!fp)
     {
         fprintf(stderr, "Error opening file '%s'\n", filename);
-        return 0;
+        return nullptr;
     }
 
     void *data = malloc(size);
@@ -484,14 +538,98 @@ void *loadRawFile(char *filename, size_t size)
     return data;
 }
 
-int main(int argc, char **argv)
+void* loadBinaryFile(char* filename, int &width, int &height, int &depth)
 {
-    P.density = 100.0f * 2;
-    P.brightness = 3.0f;
-    P.width = 512;
-    P.height = 512;
-    P.albedo = 1.0f;
-    P.g = 0; //  0.877f;
+    FILE *fp = fopen(filename, "rb");
+    if (!fp)
+    {
+        fclose(fp);
+        fprintf(stderr, "Error opening file '%s'\n", filename);
+        return nullptr;
+    }
+
+    fread(&width, sizeof(int), 1, fp);
+    fread(&height, sizeof(int), 1, fp);
+    fread(&depth, sizeof(int), 1, fp);
+
+    if (width < 0 || height < 0 || depth < 0)
+    {
+        fclose(fp);
+        fprintf(stderr, "Invalid resolution of file '%s'\n", filename);
+        return nullptr;
+    }
+
+    size_t total = size_t(width) * size_t(height) * size_t(depth);
+    if (total > 1llu << 33)
+    {
+        fclose(fp);
+        fprintf(stderr, "Resolution too large of file '%s'\n", filename);
+        return nullptr;
+    }
+
+    float* dataf = reinterpret_cast<float*>(malloc(sizeof(float) * total));
+    size_t read = fread(dataf, sizeof(float), width * height * depth, fp);
+    fclose(fp);
+    printf("Read '%s', %zu bytes\n", filename, read);
+
+    // normalize the volume values
+    VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
+    for (size_t i = 0; i < total; i++)
+    {
+        data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+    }
+    free(dataf);
+
+    return data;
+}
+
+#if USE_OPENVDB
+void* loadVdbFile(char* filename, int& width, int& height, int& depth)
+{
+    auto dataf = load_vdb(filename, width, height, depth);
+
+    if (!dataf)
+    {
+        fprintf(stderr, "Error opening file '%s'\n", filename);
+        free(dataf);
+        return nullptr;
+    }
+
+    if (width < 0 || height < 0 || depth < 0)
+    {
+        fprintf(stderr, "Invalid resolution of file '%s'\n", filename);
+        free(dataf);
+        return nullptr;
+    }
+
+    size_t total = size_t(width) * size_t(height) * size_t(depth);
+    if (total > 1llu << 33)
+    {
+        fprintf(stderr, "Resolution too large of file '%s'\n", filename);
+        free(dataf);
+        return nullptr;
+    }
+
+    // normalize the volume values
+    VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
+    for (size_t i = 0; i < total; i++)
+    {
+        data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+    }
+    free(dataf);
+
+    return data;
+}
+#endif
+
+int main(int argc, char** argv)
+{
+    P.brightness = 1.0f;
+    P.width      = 960;
+    P.height     = 512;
+    P.albedo     = 1.0f;
+    P.g          = 0.877f;
+    P.density    = 800;
 
     //start logs
     printf("%s Starting...\n\n", sSDKsample);
@@ -502,6 +640,7 @@ int main(int argc, char **argv)
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_RGB | GLUT_DOUBLE);
     glutInitWindowSize(P.width, P.height);
+
     glutCreateWindow("CUDA volume rendering");
     glewInit();
     if (!glewIsSupported("GL_VERSION_2_0 GL_ARB_pixel_buffer_object"))
@@ -510,11 +649,17 @@ int main(int argc, char **argv)
         exit(EXIT_SUCCESS);
     }
 
-    void *h_volume = new VolumeType[volumeSize.width * volumeSize.height * volumeSize.depth];
-
-    init_cuda(h_volume, volumeSize);
+    int        width, height, depth;
+    #if USE_OPENVDB
+    void*      h_volume   = loadVdbFile("wdas_cloud_quarter.vdb", width, height, depth);
+    cudaExtent volumeSize = make_cudaExtent(width, height, depth);
+    TextureVolume::init_cuda(h_volume, volumeSize);
     free(h_volume);
-
+    TextureVolume::set_texture_filter_mode(false);
+    #else
+    cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
+    TextureVolume::init_cuda(nullptr, volumeSize);
+    #endif
 
     printf("Press '+' and '-' to change density (0.01 increments)\n"
            "      ']' and '[' to change brightness\n");

@@ -26,6 +26,24 @@ typedef unsigned char uchar;
 //typedef unsigned short VolumeType;
 typedef unsigned char VolumeType;
 
+class CudaRng
+{
+    curandStateXORWOW_t state;
+
+public:
+    __device__
+    void init(unsigned int seed)
+    {
+        curand_init(seed, 0, 0, &state);
+    }
+
+    __device__
+    float next()
+    {
+        return curand_uniform(&state);
+    }
+};
+
 class FractalJuliaSet
 {
     float radius;
@@ -97,26 +115,76 @@ public:
     }
 };
 
-class CudaRng
+namespace TextureVolume
 {
-    curandStateXORWOW_t state;
-
-public:
-    __device__
-    void init(unsigned int seed)
-    {
-        curand_init(seed, 0, 0, &state);
-    }
-
-    __device__
-    float next()
-    {
-        return curand_uniform(&state);
-    }
-};
-
 cudaArray *d_volumeArray = 0;
 texture<VolumeType, 3, cudaReadModeNormalizedFloat> density_tex;         // 3D texture
+__constant__ float3                                 c_box_min;
+__constant__ float3                                 c_box_max;
+__constant__ float3                                 c_world_to_normalized;
+
+extern "C"
+void init_cuda(void *h_volume, cudaExtent volumeSize)
+{
+    if (h_volume)
+    {
+        // create 3D array
+        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<VolumeType>();
+        checkCudaErrors(cudaMalloc3DArray(&d_volumeArray, &channelDesc, volumeSize));
+
+        // copy data to 3D array
+        cudaMemcpy3DParms copyParams = {0};
+        copyParams.srcPtr   = make_cudaPitchedPtr(h_volume,
+            volumeSize.width * sizeof(VolumeType), volumeSize.width, volumeSize.height);
+        copyParams.dstArray = d_volumeArray;
+        copyParams.extent   = volumeSize;
+        copyParams.kind     = cudaMemcpyHostToDevice;
+        checkCudaErrors(cudaMemcpy3D(&copyParams));
+
+        // set texture parameters
+        density_tex.normalized = true;                      // access with normalized texture coordinates
+        density_tex.filterMode = cudaFilterModeLinear;      // linear interpolation
+        density_tex.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
+        density_tex.addressMode[1] = cudaAddressModeClamp;
+
+        // bind array to 3D texture
+        checkCudaErrors(cudaBindTextureToArray(density_tex, d_volumeArray, channelDesc));
+    }
+
+    //
+    float3 box_min =
+        make_float3(-1.0f,
+                    -(float)volumeSize.height / (float)volumeSize.width,
+                    -(float)volumeSize.depth / (float)volumeSize.width);
+    float3 box_max =
+        make_float3(1.0f,
+                    (float)volumeSize.height / (float)volumeSize.width,
+                    (float)volumeSize.depth / (float)volumeSize.width);
+    float3 world_to_normalized =
+        make_float3(1.0f,
+                    (float)volumeSize.width / (float)volumeSize.height,
+                    (float)volumeSize.width / (float)volumeSize.depth);
+
+    checkCudaErrors(cudaMemcpyToSymbol(c_box_min, &box_min, sizeof(float3)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_box_max, &box_max, sizeof(float3)));
+    checkCudaErrors(cudaMemcpyToSymbol(
+        c_world_to_normalized, &world_to_normalized, sizeof(float3)));
+}
+
+extern "C"
+void set_texture_filter_mode(bool bLinearFilter)
+{
+    density_tex.filterMode = bLinearFilter ? cudaFilterModeLinear : cudaFilterModePoint;
+}
+
+extern "C"
+void free_cuda_buffers()
+{
+    checkCudaErrors(cudaFreeArray(d_volumeArray));
+}
+
+}
+
 CudaRng *cuda_rng = nullptr;
 
 class Frame
@@ -168,7 +236,7 @@ class HGPhaseFunction
             float s = 2.0f * rnd0 - 1.0f;
             float f = (1.0f - g * g) / (1.0f + g * s);
             cos_theta = (0.5f / g) * (1.0f + g * g - f * f);
-            cos_theta = max(0.0f, min(1.0f, cos_theta));
+            cos_theta = fmaxf(0.0f, fminf(1.0f, cos_theta));
         }
         else
         {
@@ -226,7 +294,7 @@ struct Ray
 // http://www.siggraph.org/education/materials/HyperGraph/raytrace/rtinter3.htm
 
 __device__
-int intersectBox(Ray r, float3 boxmin, float3 boxmax, float *tnear, float *tfar)
+int intersectBox(Ray r, const float3& boxmin, const float3& boxmax, float *tnear, float *tfar)
 {
     // compute intersection of ray with all six bbox planes
     float3 invR = make_float3(1.0f) / r.d;
@@ -273,32 +341,34 @@ float4 mul(const float3x4 &M, const float4 &v)
 __device__
 float vol_sigma_t(const float3& pos, float density)
 {
-//     return density;
-
-
-//     // remap position to [0, 1] coordinates
-//     float t = tex3D(density_tex, pos.x * 0.5f + 0.5f, pos.y * 0.5f + 0.5f, pos.z * 0.5f + 0.5f);
-//     t = clamp(t, 0.0f, 1.0f) * density;
-//     return t;
-
-
-//     float x = pos.x * 0.5f + 0.5f;
-//     float y = pos.y * 0.5f + 0.5f;
-//     float z = pos.z * 0.5f + 0.5f;
-//     int xi = (int)ceil(5.0 * x);
-//     int yi = (int)ceil(5.0 * y);
-//     int zi = (int)ceil(5.0 * z);
-//     return float((xi + yi + zi) & 0x01) * density;
-
-
+#if USE_OPENVDB
+    // remap position to [0, 1] coordinates
+    float3 pos_ = pos * TextureVolume::c_world_to_normalized;
+    float  t    = tex3D(TextureVolume::density_tex,
+                    pos_.x * 0.5f + 0.5f,
+                    pos_.y * 0.5f + 0.5f,
+                    pos_.z * 0.5f + 0.5f);
+    //t           = clamp(t, 0.0f, 1.0f) * density;
+    t           *= density;
+    return t;
+#elif 0
+    float x  = pos.x * 0.5f + 0.5f;
+    float y  = pos.y * 0.5f + 0.5f;
+    float z  = pos.z * 0.5f + 0.5f;
+    int   xi = (int)ceil(5.0 * x);
+    int   yi = (int)ceil(5.0 * y);
+    int   zi = (int)ceil(5.0 * z);
+    return float((xi + yi + zi) & 0x01) * density;
+#else
     FractalJuliaSet fract;
-    return fract.density(pos) * density;
+    return fract.density(pos * TextureVolume::c_world_to_normalized) * density;
+#endif
 }
 
 __device__
 float Tr(
-    const float3 boxMin,
-    const float3 boxMax,
+    const float3& boxMin,
+    const float3& boxMax,
     const float3& start_point,
     const float3& end_point,
     float inv_sigma,
@@ -317,7 +387,7 @@ float Tr(
     }
     if (t_near < 0.0f) t_near = 0.0f;     // clamp to near plane
 
-    float max_t = min(t_far, length(start_point - end_point));
+    float max_t = fminf(t_far, length(start_point - end_point));
 
     float dist = t_near;
 
@@ -341,7 +411,8 @@ float Tr(
 __device__ __forceinline__
 float4 background(const float3& dir)
 {
-    return make_float4(0.15f, 0.20f, 0.25f, 1.0f) * 0.5f * (dir.y + 0.5);
+    //return make_float4(0.15f, 0.20f, 0.25f, 1.0f) * 0.5f * (dir.y + 0.5);
+    return (dir.y > -0.1f) ? make_float4(0.03, 0.07, 0.23, 1.0f) : make_float4(0.03, 0.03, 0.03, 1.0f);
 }
 
 __global__ void
@@ -351,11 +422,11 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
     const float brightness = P.brightness;
     const float albedo = P.albedo;
 
-    const float3 light_pos = make_float3(100, 100, 100);
-    const float3 light_power = make_float3(1.0, 0.9, 0.8);
+    const float3 light_dir   = make_float3(0.5826, 0.7660, 0.2717);
+    const float3 light_power = make_float3(2.6, 2.5, 2.3);
 
-    const float3 boxMin = make_float3(-1.0f, -1.0f, -1.0f);
-    const float3 boxMax = make_float3(1.0f, 1.0f, 1.0f);
+    const float3& boxMin = TextureVolume::c_box_min;
+    const float3& boxMax = TextureVolume::c_box_max;
 
     uint x = blockIdx.x*blockDim.x + threadIdx.x;
     uint y = blockIdx.y*blockDim.y + threadIdx.y;
@@ -363,22 +434,25 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
     if ((x >= P.width) || (y >= P.height)) return;
 
     CudaRng& rng = rngs[x + y * P.width];
-    float u = (x / (float) P.width) * 2.0f - 1.0f;
-    float v = (y / (float) P.height) * 2.0f - 1.0f;
-
-    HGPhaseFunction phase(P.g);
+    //float    u   = (x * 2.0f - P.width) / P.height;
+    //float    v   = (y * 2.0f - P.height) / P.height;
+    float    u   = (x * 2.0f - P.width) / P.width;
+    float    v   = (y * 2.0f - P.height) / P.width;
 
     // calculate eye ray in world space
+    float fovx = 54.43;
+
     Ray cr;
     cr.o = make_float3(mul(c_invViewMatrix, make_float4(0.0f, 0.0f, 0.0f, 1.0f)));
-    cr.d = normalize(make_float3(u, v, -2.0f));
+    cr.d = normalize(make_float3(u, v, -1.0f / tan(fovx * 0.00872664626)));
+    //cr.d = normalize(make_float3(u, v, -2.0));
     cr.d = mul(c_invViewMatrix, cr.d);
 
     float4 radiance = make_float4(0.0f);
     float throughput = 1.0f;
 
     int i;
-    for (i = 0; i < 20000; i++)
+    for (i = 0; i < 10000; i++)
     {
         // find intersection with box
         float t_near, t_far;
@@ -398,7 +472,15 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
         /// woodcock tracking / delta tracking
         float3 pos = cr.o + cr.d * t_near; // current position
         float dist = t_near;
-        float max_sigma_t = density;
+
+        // hyperion trick
+        float s = fmaxf(0.0f, fminf(1.0f, (i - 5) * 0.066666666666666666667f));
+        float g = (1 - s) * P.g;
+        float sigma_t = (1 - s) * density + s * density * (1 - P.g);
+
+        HGPhaseFunction phase(g);
+
+        float max_sigma_t = sigma_t; // max volume density is 1
         float inv_sigma = 1.0f / max_sigma_t;
 
         bool through = false;
@@ -412,7 +494,7 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
                 through = true; // transmitted through the volume, probability is 1-exp(-optical_thickness)
                 break;
             }
-            if (rng.next() < vol_sigma_t(pos, density) * inv_sigma)
+            if (rng.next() < vol_sigma_t(pos, sigma_t) * inv_sigma)
             {
                 break;
             }
@@ -430,8 +512,8 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
         Frame frame(cr.d);
 
         // direct lighting
-        float a = Tr(boxMin, boxMax, pos, light_pos, inv_sigma, density, rng);
-        radiance += make_float4(light_power * (throughput * phase.evaluate(frame, normalize(light_pos - pos)) * a), 0.0f);
+        float a = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma, sigma_t, rng);
+        radiance += make_float4(light_power * (throughput * phase.evaluate(frame, light_dir) * a), 0.0f);
 
         // scattered direction
         float3 new_dir = phase.sample(frame, rng.next(), rng.next());
@@ -444,42 +526,10 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
     // write output color
     float heat = i * 0.001;
     d_output[x + y * P.width] += make_float4(
-        max(radiance.x, 0.0f),
-        max(radiance.y, 0.0f),
-        max(radiance.z, 0.0f),
+        fmaxf(radiance.x, 0.0f),
+        fmaxf(radiance.y, 0.0f),
+        fmaxf(radiance.z, 0.0f),
         heat);
-}
-
-extern "C"
-void set_texture_filter_mode(bool bLinearFilter)
-{
-    density_tex.filterMode = bLinearFilter ? cudaFilterModeLinear : cudaFilterModePoint;
-}
-
-extern "C"
-void init_cuda(void *h_volume, cudaExtent volumeSize)
-{
-    // create 3D array
-    cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<VolumeType>();
-    checkCudaErrors(cudaMalloc3DArray(&d_volumeArray, &channelDesc, volumeSize));
-
-    // copy data to 3D array
-    cudaMemcpy3DParms copyParams = {0};
-    copyParams.srcPtr   = make_cudaPitchedPtr(h_volume,
-        volumeSize.width * sizeof(VolumeType), volumeSize.width, volumeSize.height);
-    copyParams.dstArray = d_volumeArray;
-    copyParams.extent   = volumeSize;
-    copyParams.kind     = cudaMemcpyHostToDevice;
-    checkCudaErrors(cudaMemcpy3D(&copyParams));
-
-    // set texture parameters
-    density_tex.normalized = true;                      // access with normalized texture coordinates
-    density_tex.filterMode = cudaFilterModeLinear;      // linear interpolation
-    density_tex.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
-    density_tex.addressMode[1] = cudaAddressModeClamp;
-
-    // bind array to 3D texture
-    checkCudaErrors(cudaBindTextureToArray(density_tex, d_volumeArray, channelDesc));
 }
 
 extern "C"
@@ -488,11 +538,6 @@ void copy_inv_view_matrix(float *invViewMatrix, size_t sizeofMatrix)
     checkCudaErrors(cudaMemcpyToSymbol(c_invViewMatrix, invViewMatrix, sizeofMatrix));
 }
 
-extern "C"
-void free_cuda_buffers()
-{
-    checkCudaErrors(cudaFreeArray(d_volumeArray));
-}
 
 
 
@@ -532,14 +577,17 @@ void init_rng(dim3 gridSize, dim3 blockSize, int width, int height)
 {
     cout << "init cuda rng to " << width << " x " << height << endl;
     unsigned int *seeds;
-    checkCudaErrors(cudaMallocManaged(&seeds, sizeof(unsigned int) * width * height));
-    checkCudaErrors(cudaDeviceSynchronize());
+    checkCudaErrors(cudaMalloc(&seeds, sizeof(unsigned int) * width * height));
+
+    unsigned int* h_seeds = new unsigned int[width * height];
     for (int i = 0; i < width * height; ++i)
     {
-        seeds[i] = XORShift::frand();
+        h_seeds[i] = XORShift::frand();
     }
+    checkCudaErrors(
+        cudaMemcpy(seeds, h_seeds, sizeof(unsigned int) * width * height, cudaMemcpyHostToDevice));
+    delete h_seeds;
 
-    checkCudaErrors(cudaDeviceSynchronize());
     checkCudaErrors(cudaMalloc(&cuda_rng, sizeof(CudaRng) * width * height));
     __init_rng << <gridSize, blockSize >> >(cuda_rng, width, height, seeds);
     checkCudaErrors(cudaFree(seeds));
@@ -573,4 +621,20 @@ extern "C"
 void scale(float4 *dst, float4 *src, int size, float scale)
 {
     __scale << <(size + 256 - 1) / 256, 256 >> >(dst, src, size, scale);
+}
+
+__global__ void __gamma_correct(float4* dst, float4* src, int size, float scale, float gamma)
+{
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= size)
+    {
+        return;
+    }
+    float4 d = src[idx] * scale;
+    dst[idx] = make_float4(powf(d.x, gamma), powf(d.y, gamma), powf(d.z, gamma), 1.0f);
+}
+
+extern "C" void gamma_correct(float4* dst, float4* src, int size, float scale, float gamma)
+{
+    __gamma_correct<<<(size + 256 - 1) / 256, 256>>>(dst, src, size, scale, 1.0f / gamma);
 }
