@@ -5,3 +5,6 @@ Release/
 .vs/
 _build/
 *.bat
+.vscode/
+*vdb
+*bin

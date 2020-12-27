@@ -354,13 +354,15 @@ void keyboard(unsigned char key, int x, int y)
             break;
 
         case 'x':
-            P.albedo += 0.01;
-            P.albedo = std::max(0.0f, std::min(P.albedo, 1.0f));
+            P.albedo.x = std::max(0.0f, std::min(P.albedo.x + 0.01f, 1.0f));
+            P.albedo.y = std::max(0.0f, std::min(P.albedo.y + 0.01f, 1.0f));
+            P.albedo.z = std::max(0.0f, std::min(P.albedo.z + 0.01f, 1.0f));
             break;
 
         case 'z':
-            P.albedo -= 0.01;
-            P.albedo = std::max(0.0f, std::min(P.albedo, 1.0f));
+            P.albedo.x = std::max(0.0f, std::min(P.albedo.x - 0.01f, 1.0f));
+            P.albedo.y = std::max(0.0f, std::min(P.albedo.y - 0.01f, 1.0f));
+            P.albedo.z = std::max(0.0f, std::min(P.albedo.z - 0.01f, 1.0f));
             break;
 
         case 's':
@@ -378,7 +380,7 @@ void keyboard(unsigned char key, int x, int y)
     }
 
     printf("density = %.2f, brightness = %.2f, ", P.density, P.brightness);
-    printf("albedo = %.2f, g = %.2f\n", P.albedo, P.g);
+    printf("albedo = %.2f, %.2f, %.2f, g = %.2f\n", P.albedo.x, P.albedo.y, P.albedo.z, P.g);
     glutPostRedisplay();
 
     fb->reset();
@@ -586,7 +588,9 @@ void* loadBinaryFile(char* filename, int &width, int &height, int &depth)
 #if USE_OPENVDB
 void* loadVdbFile(char* filename, int& width, int& height, int& depth)
 {
-    auto dataf = load_vdb(filename, width, height, depth);
+    float min_value, max_value;
+    auto dataf = load_vdb(filename, width, height, depth, min_value, max_value);
+    max_value = std::max(max_value, 0.0001f);
 
     if (!dataf)
     {
@@ -614,7 +618,8 @@ void* loadVdbFile(char* filename, int& width, int& height, int& depth)
     VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
     for (size_t i = 0; i < total; i++)
     {
-        data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+        //data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+        data[i] = VolumeType(std::max(0.0f, dataf[i]) / max_value * 255.0f);
     }
     free(dataf);
 
@@ -622,14 +627,47 @@ void* loadVdbFile(char* filename, int& width, int& height, int& depth)
 }
 #endif
 
+#define Mat(sigma_t, albedo, X, Y, Z, R, G, B) \
+do {                                           \
+    (sigma_t).x = X;                           \
+    (sigma_t).y = Y;                           \
+    (sigma_t).z = Z;                           \
+    (albedo).x = (X) / ((X) + (R));            \
+    (albedo).y = (Y) / ((Y) + (G));            \
+    (albedo).z = (Z) / ((Z) + (B));            \
+} while (0)
+
 int main(int argc, char** argv)
 {
     P.brightness = 1.0f;
     P.width      = 960;
     P.height     = 512;
-    P.albedo     = 1.0f;
+    P.albedo     = make_float3(1.0f, 1.0f, 1.0f);
     P.g          = 0.877f;
     P.density    = 800;
+    P.sigma_t    = make_float3(1.0f, 1.0f, 1.0f);
+
+    if (1)
+    {
+        Mat(P.sigma_t, P.albedo, 2.29f, 2.39f, 1.97f, 0.0030f, 0.0034f, 0.046f);
+        Mat(P.sigma_t, P.albedo, 0.15f, 0.21f, 0.38f, 0.015f, 0.077f, 0.19f);
+        Mat(P.sigma_t, P.albedo, 0.19f, 0.25f, 0.32f, 0.018f, 0.088f, 0.20f);
+        Mat(P.sigma_t, P.albedo, 7.38f, 5.47f, 3.15f, 0.0002f, 0.0028f, 0.0163f);
+        Mat(P.sigma_t, P.albedo, 0.18f, 0.07f, 0.03f, 0.061f, 0.97f, 1.45f);
+        Mat(P.sigma_t, P.albedo, 2.19f, 2.62f, 3.00f, 0.0021f, 0.0041f, 0.0071f);
+        Mat(P.sigma_t, P.albedo, 0.68f, 0.70f, 0.55f, 0.0024f, 0.0090f, 0.12f);
+        Mat(P.sigma_t, P.albedo, 0.70f, 1.22f, 1.90f, 0.0014f, 0.0025f, 0.0142f);
+        Mat(P.sigma_t, P.albedo, 0.74f, 0.88f, 1.01f, 0.032f, 0.17f, 0.48f);
+        Mat(P.sigma_t, P.albedo, 1.09f, 1.59f, 1.79f, 0.013f, 0.070f, 0.145f);
+        Mat(P.sigma_t, P.albedo, 11.6f, 20.4f, 14.9f, 0.0f, 0.0f, 0.0f);
+        Mat(P.sigma_t, P.albedo, 2.55f, 3.21f, 3.77f, 0.0011f, 0.0024f, 0.014f);
+        Mat(P.sigma_t, P.albedo, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+
+        float f = std::max(std::max(P.sigma_t.x, P.sigma_t.y), P.sigma_t.z);
+        P.sigma_t.x /= f;
+        P.sigma_t.y /= f;
+        P.sigma_t.z /= f;
+    }
 
     //start logs
     printf("%s Starting...\n\n", sSDKsample);
@@ -651,7 +689,8 @@ int main(int argc, char** argv)
 
     int        width, height, depth;
     #if USE_OPENVDB
-    void*      h_volume   = loadVdbFile("wdas_cloud_quarter.vdb", width, height, depth);
+    char* vdb_name = "../wdas_cloud_quarter.vdb";
+    void* h_volume = loadVdbFile(vdb_name, width, height, depth);
     cudaExtent volumeSize = make_cudaExtent(width, height, depth);
     TextureVolume::init_cuda(h_volume, volumeSize);
     free(h_volume);

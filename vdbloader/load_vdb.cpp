@@ -22,6 +22,8 @@ private:
     int                _ny;
     int                _nz;
     int                _nxy;
+    float              _min_value;
+    float              _max_value;
 
 public:
     Volume(int nx, int ny, int nz) : _nx(nx), _ny(ny), _nz(nz), _nxy(nx * ny)
@@ -29,9 +31,17 @@ public:
         _data.resize(_nx * _ny * _nz);
     }
 
+    void record_minmax(float min_value, float max_value)
+    {
+        _min_value = min_value;
+        _max_value = max_value;
+    }
+
     size_t       width() { return _nx; }
     size_t       height() { return _ny; }
     size_t       depth() { return _nz; }
+    float        min_value() { return _min_value; }
+    float        max_value() { return _max_value; }
     const float* data() const { return _data.data(); }
 
     void set(int i, int j, int k, float v)
@@ -81,6 +91,7 @@ Volume* read_voxels(openvdb::FloatGrid::ConstPtr grid)
     std::cout << "min value: " << minValue << std::endl;
     std::cout << "max value: " << maxValue << std::endl;
 
+    vol->record_minmax(minValue, maxValue);
     openvdb::tree::LeafManager<const TreeType> leafs(tree);
     BoolTreeT::Ptr interiorMask(new BoolTreeT(false));
     interiorMask->topologyUnion(tree);
@@ -108,7 +119,7 @@ Volume* read_voxels(openvdb::FloatGrid::ConstPtr grid)
     return vol;
 }
 
-float* load_vdb(char* filename, int& width, int& height, int& depth)
+float* load_vdb(char* filename, int& width, int& height, int& depth, float& min_value, float& max_value)
 {
     openvdb::initialize();
     openvdb::io::File file(filename);
@@ -133,6 +144,8 @@ float* load_vdb(char* filename, int& width, int& height, int& depth)
             width    = vol->width();
             height   = vol->height();
             depth    = vol->depth();
+            min_value = vol->min_value();
+            max_value = vol->max_value();
             size_t total_bytes =
                 sizeof(float) * vol->width() * vol->height() * vol->depth();
             data = reinterpret_cast<float*>(malloc(total_bytes));

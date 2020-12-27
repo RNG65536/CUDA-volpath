@@ -6,7 +6,9 @@ class Param
 public:
     unsigned int width, height;
     float density, brightness;
-    float albedo, g;
+    float3 albedo;
+    float g;
+    float3 sigma_t;
 };
 
 #endif // param_h__
