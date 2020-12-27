@@ -12,6 +12,9 @@ If built without OpenVDB support, a procedural Julia Set is used.
 
 References
 ----------
+
 [1] Jensen et al., A Practical Model for Subsurface Light Transport
+
 [2] Burley et al., The Design and Evolution of Disney's Hyperion Renderer
+
 [3] Kutz et al., Spectral and Decomposition Tracking for Rendering Heterogeneous Volumes
