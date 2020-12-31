@@ -17,6 +17,11 @@
 #include <helper_cuda.h>
 #include <helper_math.h>
 #include "param.h"
+
+uchar2* compute_volume_value_bound(const unsigned char* volume,
+                                   const cudaExtent&    extent,
+                                   float                search_radius);
+
 using std::cout;
 using std::endl;
 #define M_PI 3.14159265358979323846
@@ -36,6 +41,16 @@ __device__ float max_of(float a, float b, float c)
 __device__ float max_of(const float3& v)
 {
     return fmaxf(fmaxf(v.x, v.y), v.z);
+}
+
+__device__ float min_of(float a, float b, float c)
+{
+    return fminf(fminf(a, b), c);
+}
+
+__device__ float min_of(const float3& v)
+{
+    return fminf(fminf(v.x, v.y), v.z);
 }
 
 __device__ float avg_of(float a, float b, float c)
@@ -149,11 +164,51 @@ public:
 
 namespace TextureVolume
 {
-cudaArray *d_volumeArray = 0;
-texture<VolumeType, 3, cudaReadModeNormalizedFloat> density_tex;         // 3D texture
-__constant__ float3                                 c_box_min;
-__constant__ float3                                 c_box_max;
-__constant__ float3                                 c_world_to_normalized;
+__constant__ float3 c_box_min;
+__constant__ float3 c_box_max;
+__constant__ float3 c_world_to_normalized;
+constexpr float search_radius = 0.05f;  // tweak for performance
+
+cudaArray*                                          d_volumeArray = 0;
+texture<VolumeType, 3, cudaReadModeNormalizedFloat> density_tex;  // 3D texture
+
+cudaArray*                                      d_volume_bound_array = 0;
+texture<uchar2, 3, cudaReadModeNormalizedFloat> density_bound_tex;
+
+// find volume density bound (min, max) around each voxel
+static void compute_volume_bound(const unsigned char* volume,
+                                 const cudaExtent&    extent,
+                                 const float3&        boxmin,
+                                 const float3&        boxmax,
+                                 const float3&        world_to_normalized)
+{
+    auto bound_volume = compute_volume_value_bound(volume, extent, search_radius);
+
+    {
+        // create 3D array
+        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar2>();
+        checkCudaErrors(cudaMalloc3DArray(&d_volume_bound_array, &channelDesc, extent));
+
+        // copy data to 3D array
+        cudaMemcpy3DParms copyParams = {0};
+        copyParams.srcPtr   = make_cudaPitchedPtr(bound_volume, extent.width * sizeof(uchar2), extent.width, extent.height);
+        copyParams.dstArray = d_volume_bound_array;
+        copyParams.extent   = extent;
+        copyParams.kind     = cudaMemcpyHostToDevice;
+        checkCudaErrors(cudaMemcpy3D(&copyParams));
+
+        // set texture parameters
+        density_bound_tex.normalized = true;                      // access with normalized texture coordinates
+        density_bound_tex.filterMode = cudaFilterModePoint;      // linear interpolation
+        density_bound_tex.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
+        density_bound_tex.addressMode[1] = cudaAddressModeClamp;
+
+        // bind array to 3D texture
+        checkCudaErrors(cudaBindTextureToArray(density_bound_tex, d_volume_bound_array, channelDesc));
+    }
+
+    delete[] bound_volume;
+}
 
 extern "C"
 void init_cuda(void *h_volume, cudaExtent volumeSize)
@@ -199,8 +254,9 @@ void init_cuda(void *h_volume, cudaExtent volumeSize)
 
     checkCudaErrors(cudaMemcpyToSymbol(c_box_min, &box_min, sizeof(float3)));
     checkCudaErrors(cudaMemcpyToSymbol(c_box_max, &box_max, sizeof(float3)));
-    checkCudaErrors(cudaMemcpyToSymbol(
-        c_world_to_normalized, &world_to_normalized, sizeof(float3)));
+    checkCudaErrors(cudaMemcpyToSymbol(c_world_to_normalized, &world_to_normalized, sizeof(float3)));
+
+    compute_volume_bound(reinterpret_cast<unsigned char*>(h_volume), volumeSize, box_min, box_max, world_to_normalized);
 }
 
 extern "C"
@@ -548,7 +604,7 @@ __device__ __forceinline__ float3 background(const float3& dir)
 }
 
 // enable one of these for proper spectral rendering
-// disable both for fast non spectral rendering (only works for nonspectral media)
+// disable both for fast non spectral rendering (only works for achromatic media)
 #define MULTI_CHANNEL 0
 #define SPECTRAL_TRACKING 1
 
@@ -589,8 +645,8 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
     float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
 
 #if MULTI_CHANNEL
-    int   channel   = (1.0f - rng.next()) * 3.0f;
-    float sigma_t   = density * GetChannel(P.sigma_t, channel);
+    int   channel = fminf((1.0f - rng.next()) * 3.0f, 2.99999f);
+    float sigma_t = density * GetChannel(P.sigma_t, channel);
 #elif SPECTRAL_TRACKING
     float3 sigma_t_spectral = P.sigma_t;
     float3 sigma_s_spectral = sigma_t_spectral * P.albedo;
@@ -735,8 +791,313 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
 #endif
 }
 
-extern "C"
-void copy_inv_view_matrix(float *invViewMatrix, size_t sizeofMatrix)
+__device__ float2 vol_bound_minmax(const float3& pos)
+{
+#if USE_OPENVDB
+    // remap position to [0, 1] coordinates
+    float3 pos_ = pos * TextureVolume::c_world_to_normalized;
+    return tex3D(TextureVolume::density_bound_tex,
+                 pos_.x * 0.5f + 0.5f,
+                 pos_.y * 0.5f + 0.5f,
+                 pos_.z * 0.5f + 0.5f);
+#else
+    return make_float2(0.0f, 1.0f);
+#endif
+}
+
+__device__ int intersectSuperVolume(Ray           r,
+                                    const float3& boxmin,
+                                    const float3& boxmax,
+                                    float*        tnear,
+                                    float*        tfar,
+                                    float*        dmin,
+                                    float*        dmax)
+{
+    // compute intersection of ray with all six bbox planes
+    float3 invR = make_float3(1.0f) / r.d;
+    float3 tbot = invR * (boxmin - r.o);
+    float3 ttop = invR * (boxmax - r.o);
+
+    // re-order intersections to find smallest and largest on each axis
+    float3 tmin = fminf(ttop, tbot);
+    float3 tmax = fmaxf(ttop, tbot);
+
+    // find the largest tmin and the smallest tmax
+    float largest_tmin  = max_of(tmin);
+    float smallest_tmax = min_of(tmax);
+
+    *tnear = fmaxf(largest_tmin, 0.0f);  // clamp to near plane
+    *tfar  = fminf(smallest_tmax, TextureVolume::search_radius);
+
+    float2 bound = vol_bound_minmax(r.o + r.d * (*tnear));
+    *dmin        = bound.y;
+    *dmax        = fmaxf(0.0001f, bound.x);
+
+    return smallest_tmax > largest_tmin && smallest_tmax >= 1e-3f;
+}
+
+// using tracking restart (similar to regular tracking)
+// if each TextureVolume::search_radius track length is exceeded
+// the tracker is restarted with modified ray origin only
+// and for each track a local max density is used to boost the mean free path
+__global__ void __d_render_bounded_decomp(float4*     d_output,
+                                          CudaRng*    rngs,
+                                          const Param P)
+{
+    const float  density    = P.density;
+    const float  brightness = P.brightness;
+    const float3 albedo     = P.albedo;
+
+    const float3 light_dir   = make_float3(0.5826, 0.7660, 0.2717);
+    const float3 light_power = make_float3(2.6, 2.5, 2.3);
+
+    const float3& boxMin = TextureVolume::c_box_min;
+    const float3& boxMax = TextureVolume::c_box_max;
+
+    uint x = blockIdx.x * blockDim.x + threadIdx.x;
+    uint y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if ((x >= P.width) || (y >= P.height)) return;
+
+    CudaRng& rng = rngs[x + y * P.width];
+    // float    u   = (x * 2.0f - P.width) / P.height;
+    // float    v   = (y * 2.0f - P.height) / P.height;
+    float u = (x * 2.0f - P.width) / P.width;
+    float v = (y * 2.0f - P.height) / P.width;
+
+    // calculate eye ray in world space
+    float fovx = 54.43;
+
+    Ray cr;
+    cr.o =
+        make_float3(mul(c_invViewMatrix, make_float4(0.0f, 0.0f, 0.0f, 1.0f)));
+    cr.d = (make_float3(u, v, -1.0f / tan(fovx * 0.00872664626)));
+    // cr.d = (make_float3(u, v, -2.0));
+    cr.d = normalize(mul(c_invViewMatrix, cr.d));
+
+    float3 radiance   = make_float3(0.0f);
+    float3 throughput = make_float3(1.0f, 1.0f, 1.0f);
+
+#if MULTI_CHANNEL
+    int   channel = fminf((1.0f - rng.next()) * 3.0f, 2.9999998f);
+    float sigma_t = density * GetChannel(P.sigma_t, channel);
+#elif SPECTRAL_TRACKING
+    float3 sigma_t_spectral = P.sigma_t;
+    float3 sigma_s_spectral = sigma_t_spectral * P.albedo;
+    float3 sigma_a_spectral = sigma_t_spectral - sigma_s_spectral;
+    float  max_sigma_t      = max_of(sigma_t_spectral);
+    float  min_sigma_t      = min_of(sigma_t_spectral);
+
+    // decomp
+    float  sigma_c_prime;
+    float  distc;
+    float  sigma_r_prime;
+    float3 sigma_c_spectral;
+    float  inv_sigma;
+    float  inv_sigma_t;
+#else
+    float sigma_t = density;
+#endif
+
+    int num_scatters = 0;
+
+    while (num_scatters < 10000)
+    {
+        // find intersection with box
+        float t_near, t_far;
+        float d_min, d_max;
+        int   hit = intersectSuperVolume(
+            cr, boxMin, boxMax, &t_near, &t_far, &d_min, &d_max);
+        bool use_decomposition =
+            d_min > 0.0f;  // faster then always using decomp
+
+        if (!hit)
+        {
+            radiance += background(cr.d) * throughput;
+            break;
+        }
+
+        /// woodcock tracking / delta tracking
+        float3 pos  = cr.o + cr.d * t_near;  // current position
+        float  dist = t_near;
+
+        // hyperion trick
+        float s = fmaxf(
+            0.0f, fminf(1.0f, (num_scatters - 5) * 0.066666666666666666667f));
+        float g                = (1 - s) * P.g;
+        float reduction_factor = (1 - s) + s * (1 - P.g);
+#if SPECTRAL_TRACKING
+        float density_prime = reduction_factor * density;
+        float sigma_t_prime =
+            max_sigma_t * density_prime * d_max;  // max volume density is d_max
+        float3 inv_sigma_spectral =
+            make_float3(1.0f) / (sigma_t_spectral * density_prime);
+
+        // analog decomposition tracking
+        if (use_decomposition)
+        {
+            sigma_c_prime = min_sigma_t * density_prime * d_min;
+            distc = dist - log(rng.next()) / fmaxf(sigma_c_prime, 1e-20f);
+            sigma_r_prime    = fmaxf(sigma_t_prime - sigma_c_prime, 1e-20f);
+            sigma_c_spectral = make_float3(sigma_c_prime);
+        }
+        else
+        {
+            distc            = 1e20f;
+            sigma_c_spectral = make_float3(0);
+        }
+#else
+        float sigma_t_prime = reduction_factor * sigma_t;
+#endif
+
+        HGPhaseFunction phase(g);
+
+#if SPECTRAL_TRACKING
+        inv_sigma_t = 1.0f / sigma_t_prime;  // max volume density is d_max
+        if (use_decomposition)
+        {
+            inv_sigma = 1.0f / sigma_r_prime;  // for residual tracking
+        }
+        else
+        {
+            inv_sigma = inv_sigma_t;
+        }
+#else
+        float inv_sigma = 1.0f / sigma_t_prime;  // max volume density is d_max
+#endif
+
+        bool through = false;
+        // delta tracking scattering event sampling
+        for (;;)
+        {
+#if SPECTRAL_TRACKING
+            dist += -log(rng.next()) * inv_sigma;
+            if (dist >= distc || dist >= t_far)
+            {
+                pos = cr.o + cr.d * distc;
+                break;
+            }
+            else
+            {
+                pos = cr.o + cr.d * dist;
+            }
+#else
+            dist += -log(rng.next()) * inv_sigma;
+            if (dist >= t_far)
+            {
+                through = true;  // transmitted through the volume, probability
+                                 // is 1-exp(-optical_thickness)
+                break;
+            }
+            pos = cr.o + cr.d * dist;
+#endif
+
+#if SPECTRAL_TRACKING
+            float  den            = vol_sigma_t(pos, density_prime);
+            float3 sigma_t_den    = sigma_t_spectral * den - sigma_c_spectral;
+            float3 sigma_s_den    = sigma_s_spectral * den - sigma_c_spectral;
+            float3 sigma_null_den = make_float3(sigma_t_prime) - sigma_t_den;
+
+            // history aware avg
+            float Ps = sum_of(fabsf(sigma_t_den.x * throughput.x),
+                              fabsf(sigma_t_den.y * throughput.y),
+                              fabsf(sigma_t_den.z * throughput.z));
+            float Pn = sum_of(fabsf(sigma_null_den.x * throughput.x),
+                              fabsf(sigma_null_den.y * throughput.y),
+                              fabsf(sigma_null_den.z * throughput.z));
+
+            // probability normalizer
+            float c = (Ps + Pn);
+
+            // using reduced termination rates
+            float e = rng.next() * c;
+            if (e < Ps)
+            {
+                throughput *= sigma_s_den * (inv_sigma_t * c / (Ps));
+                //++num_scatters;
+                break;
+            }
+            else
+            {
+                throughput *= sigma_null_den * (inv_sigma_t * c / Pn);
+            }
+#else
+            if (rng.next() < vol_sigma_t(pos, sigma_t_prime) * inv_sigma)
+            {
+                ++num_scatters;
+                break;
+            }
+#endif
+        }
+
+#if SPECTRAL_TRACKING
+        through = fminf(distc, dist) >= t_far;
+        num_scatters += (!through);
+#endif
+
+        // tracking restart
+        // probability is exp(-optical_thickness)
+        if (through)
+        {
+            cr.o = cr.o + cr.d * t_far;
+            continue;
+        }
+
+#if !(SPECTRAL_TRACKING)
+        throughput *= albedo;
+#endif
+
+        Frame frame(cr.d);
+
+        // direct lighting
+#if SPECTRAL_TRACKING
+        // reuse path and estimate for all channels
+        float3 a = Tr_spectral(boxMin,
+                               boxMax,
+                               pos,
+                               light_dir * 1e10f,
+                               inv_sigma_t,
+                               density_prime,
+                               sigma_t_spectral,
+                               rng);
+        radiance +=
+            light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+#else
+        float a = Tr(boxMin,
+                     boxMax,
+                     pos,
+                     light_dir * 1e10f,
+                     inv_sigma,
+                     sigma_t_prime,
+                     rng);
+        radiance +=
+            light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+#endif
+
+        // scattered direction
+        float3 new_dir = normalize(phase.sample(frame, rng.next(), rng.next()));
+        cr.o           = pos;
+        cr.d           = new_dir;
+    }
+
+    radiance *= brightness;
+
+    // write output color
+    float heat = num_scatters * 0.001;
+#if MULTI_CHANNEL
+    float4 color = make_float4(0.0f, 0.0f, 0.0f, heat);
+    GetChannel(color, channel) =
+        fmaxf(GetChannel(radiance, channel), 0.0f) * 3.0f;
+    d_output[x + y * P.width] += color;
+#else
+    d_output[x + y * P.width] += make_float4(fmaxf(radiance.x, 0.0f),
+                                             fmaxf(radiance.y, 0.0f),
+                                             fmaxf(radiance.z, 0.0f),
+                                             heat);
+#endif
+}
+
+extern "C" void copy_inv_view_matrix(float* invViewMatrix, size_t sizeofMatrix)
 {
     checkCudaErrors(cudaMemcpyToSymbol(c_invViewMatrix, invViewMatrix, sizeofMatrix));
 }
@@ -806,7 +1167,8 @@ void free_rng()
 extern "C"
 void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, const Param& p)
 {
-    __d_render<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
+    //__d_render<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
+    __d_render_bounded_decomp<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
 }
 
 __global__

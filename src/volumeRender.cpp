@@ -23,6 +23,10 @@ using std::endl;
 #include <load_vdb.h>
 #endif
 
+std::vector<Param> params;
+
+bool linearFiltering = false;
+
 typedef unsigned int uint;
 typedef unsigned char uchar;
 
@@ -57,8 +61,6 @@ typedef unsigned char VolumeType;
 
 dim3 blockSize(8, 8);
 dim3 gridSize;
-
-bool linearFiltering = true;
 
 GLuint pbo = 0;     // OpenGL pixel buffer object
 GLuint tex = 0;     // OpenGL texture object
@@ -243,12 +245,12 @@ void computeFPS()
 // render image using CUDA
 void cuda_volpath()
 {
-    // build view matrix
+    // build inverse view matrix and convert to row major
     glm::mat4 model = glm::mat4(1.0f);
     model = glm::rotate(model, glm::radians(-viewRotation.y), glm::vec3(0.0, 1.0, 0.0));
     model = glm::rotate(model, glm::radians(-viewRotation.x), glm::vec3(1.0, 0.0, 0.0));
     model = glm::translate(model, glm::vec3(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z));
-    model = glm::transpose(model); // build row major
+    model = glm::transpose(model);
 
     copy_inv_view_matrix(glm::value_ptr(model), sizeof(float4)*3);
 
@@ -373,6 +375,10 @@ void keyboard(unsigned char key, int x, int y)
         case 'a':
             P.g -= 0.01;
             P.g = std::max(-1.0f, std::min(P.g, 1.0f));
+            break;
+
+        case ' ':
+            P = params[rand() % params.size()];
             break;
 
         default:
@@ -588,6 +594,14 @@ void* loadBinaryFile(char* filename, int &width, int &height, int &depth)
 #if USE_OPENVDB
 void* loadVdbFile(char* filename, int& width, int& height, int& depth)
 {
+    FILE* f = fopen(filename, "r");
+    if (!f)
+    {
+        fprintf(stderr, "cannot open file: %s\n", filename);
+        exit(1);
+    }
+    fclose(f);
+
     float min_value, max_value;
     auto dataf = load_vdb(filename, width, height, depth, min_value, max_value);
     max_value = std::max(max_value, 0.0001f);
@@ -625,17 +639,272 @@ void* loadVdbFile(char* filename, int& width, int& height, int& depth)
 
     return data;
 }
+
+template <typename T, int MaxSize>
+class CircularBuffer
+{
+private:
+    T      _data[MaxSize];
+    size_t _begin = 0;
+    size_t _size  = 0;
+
+public:
+    void push_back(const T& v)
+    {
+        if (_size < MaxSize)
+        {
+            size_t _end = (_begin + _size) % MaxSize;
+            _data[_end] = v;
+            ++_size;
+        }
+    }
+    void pop_back()
+    {
+        if (_size > 0)
+        {
+            --_size;
+        }
+    }
+    void pop_front()
+    {
+        if (_size > 0)
+        {
+            _begin = (_begin + 1) % MaxSize;
+            --_size;
+        }
+    }
+    // void push_front();
+
+    void clear()
+    {
+        _begin = 0;
+        _size  = 0;
+    }
+    bool empty() const { return _size == 0; }
+
+    const T& front() const { return _data[_begin]; }
+    const T& back() const
+    {
+        size_t _end = (_begin + _size - 1) % MaxSize;
+        return _data[_end];
+    }
+
+    size_t size() const { return _size; }
+};
+
+uchar2* compute_volume_value_bound(const unsigned char* volume,
+                                   const cudaExtent&    extent,
+                                   float                search_radius)
+{
+    size_t  size           = extent.width * extent.height * extent.depth;
+    uchar2* bound_volume   = new uchar2[size];
+    uchar2* bound_volume_2 = new uchar2[size];
+
+    float cell_size = 2.0f / extent.width;
+
+    int diffusion_iters = ceil(search_radius / cell_size);
+    printf_s("diffusion iters = %d\n", diffusion_iters);
+
+    constexpr size_t buffer_size = 64; // must be larger than diffusion_iters * 2 + 1
+
+    int nx  = extent.width;
+    int ny  = extent.height;
+    int nz  = extent.depth;
+    int nxy = nx * ny;
+
+    for (size_t i = 0; i < size; i++)
+    {
+        bound_volume[i] = make_uchar2(volume[i], volume[i]);
+    }
+
+    int window_size = diffusion_iters * 2 + 1;
+
+    Timer timer;
+    float elapsed;
+
+    for (int sweep_dir = 0; sweep_dir < 3; sweep_dir++)
+    {
+        switch (sweep_dir)
+        {
+        default:
+            break;
+        case 0:
+            timer.record();
+
+#pragma omp parallel for
+            for (int k = 0; k < nz; k++)
+            for (int j = 0; j < ny; j++)
+            {
+                CircularBuffer<int, buffer_size> max_window;
+                CircularBuffer<int, buffer_size> min_window;
+
+                size_t offset = j * nx + k * nxy;
+
+                for (int i = 0; i < window_size; i++)
+                {
+                    uchar2 d = bound_volume[i + offset];
+                    if (i > diffusion_iters)
+                    {
+                        unsigned char dmax = bound_volume[max_window.front() + offset].x;
+                        unsigned char dmin = bound_volume[min_window.front() + offset].y;
+                        bound_volume_2[(i - diffusion_iters - 1) + offset] = make_uchar2(dmax, dmin);
+                    }
+
+                    while (!max_window.empty() && d.x > bound_volume[max_window.back() + offset].x) max_window.pop_back();
+                    while (!min_window.empty() && d.y < bound_volume[min_window.back() + offset].y) min_window.pop_back();
+                    max_window.push_back(i);
+                    min_window.push_back(i);
+                }
+
+                for (int i = window_size; i < nx + diffusion_iters + 1; i++)
+                {
+                    unsigned char dmax = bound_volume[max_window.front() + offset].x;
+                    unsigned char dmin = bound_volume[min_window.front() + offset].y;
+                    bound_volume_2[(i - diffusion_iters - 1) + offset] = make_uchar2(dmax, dmin);
+
+                    if (i < nx)
+                    {
+                        uchar2 d = bound_volume[i + offset];
+
+                        while (!max_window.empty() && d.x > bound_volume[max_window.back() + offset].x) max_window.pop_back();
+                        while (!min_window.empty() && d.y < bound_volume[min_window.back() + offset].y) min_window.pop_back();
+                        if (!max_window.empty() && max_window.front() <= i - (window_size)) max_window.pop_front();
+                        if (!min_window.empty() && min_window.front() <= i - (window_size)) min_window.pop_front();
+                        max_window.push_back(i);
+                        min_window.push_back(i);
+                    }
+                }
+            }
+
+            elapsed = timer.elapsed();
+            printf_s("sweeping x took %f us\n", elapsed);
+            break;
+        case 1:
+            timer.record();
+
+#pragma omp parallel for
+            for (int k = 0; k < nz; k++)
+            for (int i = 0; i < nx; i++)
+            {
+                CircularBuffer<int, buffer_size> max_window;
+                CircularBuffer<int, buffer_size> min_window;
+
+                size_t offset = i + k * nxy;
+
+                for (int j = 0; j < window_size; j++)
+                {
+                    uchar2 d = bound_volume[j * nx + offset];
+                    if (j > diffusion_iters)
+                    {
+                        unsigned char dmax = bound_volume[max_window.front() * nx + offset].x;
+                        unsigned char dmin = bound_volume[min_window.front() * nx + offset].y;
+                        bound_volume_2[(j - diffusion_iters - 1) * nx + offset] = make_uchar2(dmax, dmin);
+                    }
+
+                    while (!max_window.empty() && d.x > bound_volume[max_window.back() * nx + offset].x) max_window.pop_back();
+                    while (!min_window.empty() && d.y < bound_volume[min_window.back() * nx + offset].y) min_window.pop_back();
+                    max_window.push_back(j);
+                    min_window.push_back(j);
+                }
+
+                for (int j = window_size; j < ny + diffusion_iters + 1; j++)
+                {
+                    unsigned char dmax = bound_volume[max_window.front() * nx + offset].x;
+                    unsigned char dmin = bound_volume[min_window.front() * nx + offset].y;
+                    bound_volume_2[(j - diffusion_iters - 1) * nx + offset] = make_uchar2(dmax, dmin);
+
+                    if (j < ny)
+                    {
+                        uchar2 d = bound_volume[j * nx + offset];
+
+                        while (!max_window.empty() && d.x > bound_volume[max_window.back() * nx + offset].x) max_window.pop_back();
+                        while (!min_window.empty() && d.y < bound_volume[min_window.back() * nx + offset].y) min_window.pop_back();
+                        if (!max_window.empty() && max_window.front() <= j - (window_size)) max_window.pop_front();
+                        if (!min_window.empty() && min_window.front() <= j - (window_size)) min_window.pop_front();
+                        max_window.push_back(j);
+                        min_window.push_back(j);
+                    }
+                }
+            }
+
+            elapsed = timer.elapsed();
+            printf_s("sweeping y took %f us\n", elapsed);
+            break;
+        case 2:
+            timer.record();
+
+#pragma omp parallel for
+            for (int j = 0; j < ny; j++)
+            for (int i = 0; i < nx; i++)
+            {
+                CircularBuffer<int, buffer_size> max_window;
+                CircularBuffer<int, buffer_size> min_window;
+
+                size_t offset = i + j * nx;
+
+                for (int k = 0; k < window_size; k++)
+                {
+                    uchar2 d = bound_volume[k * nxy + offset];
+                    if (k > diffusion_iters)
+                    {
+                        unsigned char dmax = bound_volume[max_window.front() * nxy + offset].x;
+                        unsigned char dmin = bound_volume[min_window.front() * nxy + offset].y;
+                        bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] = make_uchar2(dmax, dmin);
+                    }
+
+                    while (!max_window.empty() && d.x > bound_volume[max_window.back() * nxy + offset].x) max_window.pop_back();
+                    while (!min_window.empty() && d.y > bound_volume[min_window.back() * nxy + offset].y) min_window.pop_back();
+                    max_window.push_back(k);
+                    min_window.push_back(k);
+                }
+
+                for (int k = window_size; k < nz + diffusion_iters + 1; k++)
+                {
+                    unsigned char dmax = bound_volume[max_window.front() * nxy + offset].x;
+                    unsigned char dmin = bound_volume[min_window.front() * nxy + offset].y;
+                    bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] = make_uchar2(dmax, dmin);
+
+                    if (k < nz)
+                    {
+                        uchar2 d = bound_volume[k * nxy + offset];
+
+                        while (!max_window.empty() && d.x > bound_volume[max_window.back() * nxy + offset].x) max_window.pop_back();
+                        while (!min_window.empty() && d.y < bound_volume[min_window.back() * nxy + offset].y) min_window.pop_back();
+                        if (!max_window.empty() && max_window.front() <= k - (window_size)) max_window.pop_front();
+                        if (!min_window.empty() && min_window.front() <= k - (window_size)) min_window.pop_front();
+                        max_window.push_back(k);
+                        min_window.push_back(k);
+                    }
+                }
+            }
+
+            elapsed = timer.elapsed();
+            printf_s("sweeping z took %f us\n", elapsed);
+            break;
+        }
+        std::swap(bound_volume, bound_volume_2);
+    }
+    
+    delete[] bound_volume_2;
+
+    return bound_volume;
+}
 #endif
 
-#define Mat(sigma_t, albedo, X, Y, Z, R, G, B) \
-do {                                           \
-    (sigma_t).x = X;                           \
-    (sigma_t).y = Y;                           \
-    (sigma_t).z = Z;                           \
-    (albedo).x = (X) / ((X) + (R));            \
-    (albedo).y = (Y) / ((Y) + (G));            \
-    (albedo).z = (Z) / ((Z) + (B));            \
-} while (0)
+void Mat(Param& P, float X, float Y, float Z, float R, float G, float B)
+{
+    P.sigma_t.x = ((X) + (R));
+    P.sigma_t.y = ((Y) + (G));
+    P.sigma_t.z = ((Z) + (B));
+    P.albedo.x  = (X) / P.sigma_t.x;
+    P.albedo.y  = (Y) / P.sigma_t.y;
+    P.albedo.z  = (Z) / P.sigma_t.z;
+    float f     = std::max(std::max(P.sigma_t.x, P.sigma_t.y), P.sigma_t.z);
+    P.sigma_t.x /= f;
+    P.sigma_t.y /= f;
+    P.sigma_t.z /= f;
+    params.push_back(P);
+}
 
 int main(int argc, char** argv)
 {
@@ -649,24 +918,19 @@ int main(int argc, char** argv)
 
     if (1)
     {
-        Mat(P.sigma_t, P.albedo, 2.29f, 2.39f, 1.97f, 0.0030f, 0.0034f, 0.046f);
-        Mat(P.sigma_t, P.albedo, 0.15f, 0.21f, 0.38f, 0.015f, 0.077f, 0.19f);
-        Mat(P.sigma_t, P.albedo, 0.19f, 0.25f, 0.32f, 0.018f, 0.088f, 0.20f);
-        Mat(P.sigma_t, P.albedo, 7.38f, 5.47f, 3.15f, 0.0002f, 0.0028f, 0.0163f);
-        Mat(P.sigma_t, P.albedo, 0.18f, 0.07f, 0.03f, 0.061f, 0.97f, 1.45f);
-        Mat(P.sigma_t, P.albedo, 2.19f, 2.62f, 3.00f, 0.0021f, 0.0041f, 0.0071f);
-        Mat(P.sigma_t, P.albedo, 0.68f, 0.70f, 0.55f, 0.0024f, 0.0090f, 0.12f);
-        Mat(P.sigma_t, P.albedo, 0.70f, 1.22f, 1.90f, 0.0014f, 0.0025f, 0.0142f);
-        Mat(P.sigma_t, P.albedo, 0.74f, 0.88f, 1.01f, 0.032f, 0.17f, 0.48f);
-        Mat(P.sigma_t, P.albedo, 1.09f, 1.59f, 1.79f, 0.013f, 0.070f, 0.145f);
-        Mat(P.sigma_t, P.albedo, 11.6f, 20.4f, 14.9f, 0.0f, 0.0f, 0.0f);
-        Mat(P.sigma_t, P.albedo, 2.55f, 3.21f, 3.77f, 0.0011f, 0.0024f, 0.014f);
-        Mat(P.sigma_t, P.albedo, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
-
-        float f = std::max(std::max(P.sigma_t.x, P.sigma_t.y), P.sigma_t.z);
-        P.sigma_t.x /= f;
-        P.sigma_t.y /= f;
-        P.sigma_t.z /= f;
+        Mat(P, 2.29f, 2.39f, 1.97f, 0.0030f, 0.0034f, 0.046f);
+        Mat(P, 0.15f, 0.21f, 0.38f, 0.015f, 0.077f, 0.19f);
+        Mat(P, 0.19f, 0.25f, 0.32f, 0.018f, 0.088f, 0.20f);
+        Mat(P, 7.38f, 5.47f, 3.15f, 0.0002f, 0.0028f, 0.0163f);
+        Mat(P, 0.18f, 0.07f, 0.03f, 0.061f, 0.97f, 1.45f);
+        Mat(P, 2.19f, 2.62f, 3.00f, 0.0021f, 0.0041f, 0.0071f);
+        Mat(P, 0.68f, 0.70f, 0.55f, 0.0024f, 0.0090f, 0.12f);
+        Mat(P, 0.70f, 1.22f, 1.90f, 0.0014f, 0.0025f, 0.0142f);
+        Mat(P, 0.74f, 0.88f, 1.01f, 0.032f, 0.17f, 0.48f);
+        Mat(P, 1.09f, 1.59f, 1.79f, 0.013f, 0.070f, 0.145f);
+        Mat(P, 11.6f, 20.4f, 14.9f, 0.0f, 0.0f, 0.0f);
+        Mat(P, 2.55f, 3.21f, 3.77f, 0.0011f, 0.0024f, 0.014f);
+        Mat(P, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
     }
 
     //start logs
@@ -678,6 +942,7 @@ int main(int argc, char** argv)
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_RGB | GLUT_DOUBLE);
     glutInitWindowSize(P.width, P.height);
+    glutInitWindowPosition(100, 100);
 
     glutCreateWindow("CUDA volume rendering");
     glewInit();
@@ -694,7 +959,7 @@ int main(int argc, char** argv)
     cudaExtent volumeSize = make_cudaExtent(width, height, depth);
     TextureVolume::init_cuda(h_volume, volumeSize);
     free(h_volume);
-    TextureVolume::set_texture_filter_mode(false);
+    TextureVolume::set_texture_filter_mode(linearFiltering);
     #else
     cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
     TextureVolume::init_cuda(nullptr, volumeSize);
