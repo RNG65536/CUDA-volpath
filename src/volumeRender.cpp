@@ -692,20 +692,38 @@ public:
     size_t size() const { return _size; }
 };
 
-uchar2* compute_volume_value_bound(const unsigned char* volume,
-                                   const cudaExtent&    extent,
-                                   float                search_radius)
+template <typename Data, typename Data2>
+Data2 make(const Data& a, const Data& b);
+
+template <>
+uchar2 make<unsigned char, uchar2>(const unsigned char& x, const unsigned char& y)
 {
-    size_t  size           = extent.width * extent.height * extent.depth;
-    uchar2* bound_volume   = new uchar2[size];
-    uchar2* bound_volume_2 = new uchar2[size];
+    return make_uchar2(x, y);
+}
+
+template <>
+float2 make<float, float2>(const float& x, const float& y)
+{
+    return make_float2(x, y);
+}
+
+// find volume density bound (min, max) around each voxel
+template <typename Data, typename Data2>
+Data2* compute_volume_value_bound_(const Data*       volume,
+                                   const cudaExtent& extent,
+                                   float             search_radius)
+{
+    size_t size           = extent.width * extent.height * extent.depth;
+    Data2* bound_volume   = new Data2[size];
+    Data2* bound_volume_2 = new Data2[size];
 
     float cell_size = 2.0f / extent.width;
 
+    // to ensure the diagonal is covered
     int diffusion_iters = ceil(search_radius / cell_size);
     printf_s("diffusion iters = %d\n", diffusion_iters);
 
-    constexpr size_t buffer_size = 64; // must be larger than diffusion_iters * 2 + 1
+    constexpr size_t buffer_size = 256; // must be larger than diffusion_iters * 2 + 1
 
     int nx  = extent.width;
     int ny  = extent.height;
@@ -714,7 +732,7 @@ uchar2* compute_volume_value_bound(const unsigned char* volume,
 
     for (size_t i = 0; i < size; i++)
     {
-        bound_volume[i] = make_uchar2(volume[i], volume[i]);
+        bound_volume[i] = make<Data, Data2>(volume[i], volume[i]);
     }
 
     int window_size = diffusion_iters * 2 + 1;
@@ -737,39 +755,25 @@ uchar2* compute_volume_value_bound(const unsigned char* volume,
             {
                 CircularBuffer<int, buffer_size> max_window;
                 CircularBuffer<int, buffer_size> min_window;
-
                 size_t offset = j * nx + k * nxy;
-
-                for (int i = 0; i < window_size; i++)
+                for (int i = 0; i < nx + diffusion_iters + 1; i++)
                 {
-                    uchar2 d = bound_volume[i + offset];
                     if (i > diffusion_iters)
                     {
-                        unsigned char dmax = bound_volume[max_window.front() + offset].x;
-                        unsigned char dmin = bound_volume[min_window.front() + offset].y;
-                        bound_volume_2[(i - diffusion_iters - 1) + offset] = make_uchar2(dmax, dmin);
+                        Data dmax = bound_volume[max_window.front() + offset].x;
+                        Data dmin = bound_volume[min_window.front() + offset].y;
+                        bound_volume_2[(i - diffusion_iters - 1) + offset] = make<Data, Data2>(dmax, dmin);
                     }
-
-                    while (!max_window.empty() && d.x > bound_volume[max_window.back() + offset].x) max_window.pop_back();
-                    while (!min_window.empty() && d.y < bound_volume[min_window.back() + offset].y) min_window.pop_back();
-                    max_window.push_back(i);
-                    min_window.push_back(i);
-                }
-
-                for (int i = window_size; i < nx + diffusion_iters + 1; i++)
-                {
-                    unsigned char dmax = bound_volume[max_window.front() + offset].x;
-                    unsigned char dmin = bound_volume[min_window.front() + offset].y;
-                    bound_volume_2[(i - diffusion_iters - 1) + offset] = make_uchar2(dmax, dmin);
-
                     if (i < nx)
                     {
-                        uchar2 d = bound_volume[i + offset];
-
+                        Data2 d = bound_volume[i + offset];
                         while (!max_window.empty() && d.x > bound_volume[max_window.back() + offset].x) max_window.pop_back();
                         while (!min_window.empty() && d.y < bound_volume[min_window.back() + offset].y) min_window.pop_back();
-                        if (!max_window.empty() && max_window.front() <= i - (window_size)) max_window.pop_front();
-                        if (!min_window.empty() && min_window.front() <= i - (window_size)) min_window.pop_front();
+                    }
+                    if (!max_window.empty() && max_window.front() <= i - (window_size)) max_window.pop_front();
+                    if (!min_window.empty() && min_window.front() <= i - (window_size)) min_window.pop_front();
+                    if (i < nx)
+                    {
                         max_window.push_back(i);
                         min_window.push_back(i);
                     }
@@ -788,39 +792,25 @@ uchar2* compute_volume_value_bound(const unsigned char* volume,
             {
                 CircularBuffer<int, buffer_size> max_window;
                 CircularBuffer<int, buffer_size> min_window;
-
                 size_t offset = i + k * nxy;
-
-                for (int j = 0; j < window_size; j++)
+                for (int j = 0; j < ny + diffusion_iters + 1; j++)
                 {
-                    uchar2 d = bound_volume[j * nx + offset];
                     if (j > diffusion_iters)
                     {
-                        unsigned char dmax = bound_volume[max_window.front() * nx + offset].x;
-                        unsigned char dmin = bound_volume[min_window.front() * nx + offset].y;
-                        bound_volume_2[(j - diffusion_iters - 1) * nx + offset] = make_uchar2(dmax, dmin);
+                        Data dmax = bound_volume[max_window.front() * nx + offset].x;
+                        Data dmin = bound_volume[min_window.front() * nx + offset].y;
+                        bound_volume_2[(j - diffusion_iters - 1) * nx + offset] = make<Data, Data2>(dmax, dmin);
                     }
-
-                    while (!max_window.empty() && d.x > bound_volume[max_window.back() * nx + offset].x) max_window.pop_back();
-                    while (!min_window.empty() && d.y < bound_volume[min_window.back() * nx + offset].y) min_window.pop_back();
-                    max_window.push_back(j);
-                    min_window.push_back(j);
-                }
-
-                for (int j = window_size; j < ny + diffusion_iters + 1; j++)
-                {
-                    unsigned char dmax = bound_volume[max_window.front() * nx + offset].x;
-                    unsigned char dmin = bound_volume[min_window.front() * nx + offset].y;
-                    bound_volume_2[(j - diffusion_iters - 1) * nx + offset] = make_uchar2(dmax, dmin);
-
                     if (j < ny)
                     {
-                        uchar2 d = bound_volume[j * nx + offset];
-
+                        Data2 d = bound_volume[j * nx + offset];
                         while (!max_window.empty() && d.x > bound_volume[max_window.back() * nx + offset].x) max_window.pop_back();
                         while (!min_window.empty() && d.y < bound_volume[min_window.back() * nx + offset].y) min_window.pop_back();
-                        if (!max_window.empty() && max_window.front() <= j - (window_size)) max_window.pop_front();
-                        if (!min_window.empty() && min_window.front() <= j - (window_size)) min_window.pop_front();
+                    }
+                    if (!max_window.empty() && max_window.front() <= j - (window_size)) max_window.pop_front();
+                    if (!min_window.empty() && min_window.front() <= j - (window_size)) min_window.pop_front();
+                    if (j < ny)
+                    {
                         max_window.push_back(j);
                         min_window.push_back(j);
                     }
@@ -839,39 +829,25 @@ uchar2* compute_volume_value_bound(const unsigned char* volume,
             {
                 CircularBuffer<int, buffer_size> max_window;
                 CircularBuffer<int, buffer_size> min_window;
-
                 size_t offset = i + j * nx;
-
-                for (int k = 0; k < window_size; k++)
+                for (int k = 0; k < nz + diffusion_iters + 1; k++)
                 {
-                    uchar2 d = bound_volume[k * nxy + offset];
                     if (k > diffusion_iters)
                     {
-                        unsigned char dmax = bound_volume[max_window.front() * nxy + offset].x;
-                        unsigned char dmin = bound_volume[min_window.front() * nxy + offset].y;
-                        bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] = make_uchar2(dmax, dmin);
+                        Data dmax = bound_volume[max_window.front() * nxy + offset].x;
+                        Data dmin = bound_volume[min_window.front() * nxy + offset].y;
+                        bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] = make<Data, Data2>(dmax, dmin);
                     }
-
-                    while (!max_window.empty() && d.x > bound_volume[max_window.back() * nxy + offset].x) max_window.pop_back();
-                    while (!min_window.empty() && d.y > bound_volume[min_window.back() * nxy + offset].y) min_window.pop_back();
-                    max_window.push_back(k);
-                    min_window.push_back(k);
-                }
-
-                for (int k = window_size; k < nz + diffusion_iters + 1; k++)
-                {
-                    unsigned char dmax = bound_volume[max_window.front() * nxy + offset].x;
-                    unsigned char dmin = bound_volume[min_window.front() * nxy + offset].y;
-                    bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] = make_uchar2(dmax, dmin);
-
                     if (k < nz)
                     {
-                        uchar2 d = bound_volume[k * nxy + offset];
-
+                        Data2 d = bound_volume[k * nxy + offset];
                         while (!max_window.empty() && d.x > bound_volume[max_window.back() * nxy + offset].x) max_window.pop_back();
                         while (!min_window.empty() && d.y < bound_volume[min_window.back() * nxy + offset].y) min_window.pop_back();
-                        if (!max_window.empty() && max_window.front() <= k - (window_size)) max_window.pop_front();
-                        if (!min_window.empty() && min_window.front() <= k - (window_size)) min_window.pop_front();
+                    }
+                    if (!max_window.empty() && max_window.front() <= k - (window_size)) max_window.pop_front();
+                    if (!min_window.empty() && min_window.front() <= k - (window_size)) min_window.pop_front();
+                    if (k < nz)
+                    {
                         max_window.push_back(k);
                         min_window.push_back(k);
                     }
@@ -882,12 +858,28 @@ uchar2* compute_volume_value_bound(const unsigned char* volume,
             printf_s("sweeping z took %f us\n", elapsed);
             break;
         }
+
         std::swap(bound_volume, bound_volume_2);
     }
     
     delete[] bound_volume_2;
 
     return bound_volume;
+}
+
+uchar2* compute_volume_value_bound(const unsigned char* volume,
+                                   const cudaExtent&    extent,
+                                   float                search_radius)
+{
+    return compute_volume_value_bound_<unsigned char, uchar2>(
+        volume, extent, search_radius);
+}
+float2* compute_volume_value_bound(const float*      volume,
+                                   const cudaExtent& extent,
+                                   float             search_radius)
+{
+    return compute_volume_value_bound_<float, float2>(
+        volume, extent, search_radius);
 }
 #endif
 

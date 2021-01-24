@@ -18,9 +18,11 @@
 #include <helper_math.h>
 #include "param.h"
 
+#if USE_OPENVDB
 uchar2* compute_volume_value_bound(const unsigned char* volume,
                                    const cudaExtent&    extent,
                                    float                search_radius);
+#endif
 
 using std::cout;
 using std::endl;
@@ -172,6 +174,7 @@ constexpr float search_radius = 0.05f;  // tweak for performance
 cudaArray*                                          d_volumeArray = 0;
 texture<VolumeType, 3, cudaReadModeNormalizedFloat> density_tex;  // 3D texture
 
+#if USE_OPENVDB
 cudaArray*                                      d_volume_bound_array = 0;
 texture<uchar2, 3, cudaReadModeNormalizedFloat> density_bound_tex;
 
@@ -209,6 +212,7 @@ static void compute_volume_bound(const unsigned char* volume,
 
     delete[] bound_volume;
 }
+#endif
 
 extern "C"
 void init_cuda(void *h_volume, cudaExtent volumeSize)
@@ -256,7 +260,9 @@ void init_cuda(void *h_volume, cudaExtent volumeSize)
     checkCudaErrors(cudaMemcpyToSymbol(c_box_max, &box_max, sizeof(float3)));
     checkCudaErrors(cudaMemcpyToSymbol(c_world_to_normalized, &world_to_normalized, sizeof(float3)));
 
+#if USE_OPENVDB
     compute_volume_bound(reinterpret_cast<unsigned char*>(h_volume), volumeSize, box_min, box_max, world_to_normalized);
+#endif
 }
 
 extern "C"
@@ -269,6 +275,9 @@ extern "C"
 void free_cuda_buffers()
 {
     checkCudaErrors(cudaFreeArray(d_volumeArray));
+#if USE_OPENVDB
+    checkCudaErrors(cudaFreeArray(d_volume_bound_array));
+#endif
 }
 
 }
@@ -801,7 +810,7 @@ __device__ float2 vol_bound_minmax(const float3& pos)
                  pos_.y * 0.5f + 0.5f,
                  pos_.z * 0.5f + 0.5f);
 #else
-    return make_float2(0.0f, 1.0f);
+    return make_float2(1.0f, 0.0f); // max, min
 #endif
 }
 
@@ -909,7 +918,7 @@ __global__ void __d_render_bounded_decomp(float4*     d_output,
         int   hit = intersectSuperVolume(
             cr, boxMin, boxMax, &t_near, &t_far, &d_min, &d_max);
         bool use_decomposition =
-            d_min > 0.0f;  // faster then always using decomp
+            d_min > 0.0f;  // faster than always using decomp
 
         if (!hit)
         {

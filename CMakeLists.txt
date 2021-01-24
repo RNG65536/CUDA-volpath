@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.12)
 project(volpath)
 
-include(D:/deps.cmake)
+include(D:/deps.cmake) # append thirdparty search paths to CMAKE_PREFIX_PATH
 
 option(USE_OPENVDB "Build OpenVDB loader" ON)
 
