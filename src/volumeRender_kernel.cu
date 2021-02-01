@@ -75,6 +75,7 @@ __device__ float sum_of(const float3& v)
     return (v.x + v.y + v.z);
 }
 
+#if USE_CURAND
 class CudaRng
 {
     curandStateXORWOW_t state;
@@ -92,6 +93,56 @@ public:
         return curand_uniform(&state);
     }
 };
+#else
+__device__ unsigned int Hash(unsigned int seed)
+{
+    seed = (seed ^ 61) ^ (seed >> 16);
+    seed *= 9;
+    seed = seed ^ (seed >> 4);
+    seed *= 0x27d4eb2d;
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+
+__device__ unsigned int RngNext(unsigned int& seed_x, unsigned int& seed_y)
+{
+    unsigned int result = seed_x * 0x9e3779bb;
+
+    seed_y ^= seed_x;
+    seed_x = ((seed_x << 26) | (seed_x >> (32 - 26))) ^ seed_y ^ (seed_y << 9);
+    seed_y = (seed_x << 13) | (seed_x >> (32 - 13));
+
+    return result;
+}
+
+__device__ float Rand(unsigned int& seed_x, unsigned int& seed_y)
+{
+    unsigned int u = 0x3f800000 | (RngNext(seed_x, seed_y) >> 9);
+    return __uint_as_float(u) - 1.0;
+}
+
+class CudaRng
+{
+    unsigned int seed_x, seed_y;
+
+public:
+    //__device__ void init(unsigned int pixel_x = 0, unsigned int pixel_y = 0,
+    //unsigned int frame_idx = 0)
+    __device__ void init(unsigned int pixel_x,
+                         unsigned int pixel_y,
+                         unsigned int frame_idx)
+    {
+        unsigned int s0 = (pixel_x << 16) | pixel_y;
+        unsigned int s1 = frame_idx;
+
+        seed_x = Hash(s0);
+        seed_y = Hash(s1);
+        RngNext(seed_x, seed_y);
+    }
+
+    __device__ float next() { return Rand(seed_x, seed_y); }
+};
+#endif
 
 class FractalJuliaSet
 {
@@ -635,7 +686,13 @@ __d_render(float4 *d_output, CudaRng *rngs, const Param P)
 
     if ((x >= P.width) || (y >= P.height)) return;
 
+#if USE_CURAND
     CudaRng& rng = rngs[x + y * P.width];
+#else
+    CudaRng rng;
+    rng.init(x, y, (int)rngs);
+#endif
+
     //float    u   = (x * 2.0f - P.width) / P.height;
     //float    v   = (y * 2.0f - P.height) / P.height;
     float    u   = (x * 2.0f - P.width) / P.width;
@@ -868,7 +925,13 @@ __global__ void __d_render_bounded_decomp(float4*     d_output,
 
     if ((x >= P.width) || (y >= P.height)) return;
 
+#if USE_CURAND
     CudaRng& rng = rngs[x + y * P.width];
+#else
+    CudaRng rng;
+    rng.init(x, y, (int)rngs);
+#endif
+
     // float    u   = (x * 2.0f - P.width) / P.height;
     // float    v   = (y * 2.0f - P.height) / P.height;
     float u = (x * 2.0f - P.width) / P.width;
@@ -1113,7 +1176,7 @@ extern "C" void copy_inv_view_matrix(float* invViewMatrix, size_t sizeofMatrix)
 
 
 
-
+#if USE_CURAND
 namespace XORShift
 { 
     // XOR shift PRNG
@@ -1172,10 +1235,18 @@ void free_rng()
     cout << "free cuda rng" << endl;
     checkCudaErrors(cudaFree(cuda_rng));
 }
+#else
+extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height) {}
+extern "C" void free_rng() {}
+#endif
 
 extern "C"
-void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, const Param& p)
+void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, int spp, const Param& p)
 {
+#if !(USE_CURAND)
+    cuda_rng = (CudaRng*)spp;
+#endif
+
     //__d_render<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
     __d_render_bounded_decomp<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
 }

@@ -1,0 +1,18 @@
+---
+BasedOnStyle: Google
+IndentWidth: 4
+TabWidth: 4
+AccessModifierOffset: -4
+UseTab: Never
+BreakBeforeBraces: Allman
+Standard: Cpp11
+SpacesInAngles: false
+BinPackArguments: false
+BinPackParameters: false
+BreakConstructorInitializersBeforeComma: true
+AllowShortFunctionsOnASingleLine: true
+DerivePointerAlignment: false
+PointerAlignment: Left
+AlignConsecutiveDeclarations: true
+AlignConsecutiveAssignments: true
+ColumnLimit: 100

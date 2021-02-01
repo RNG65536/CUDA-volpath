@@ -70,7 +70,7 @@ GLuint tex = 0;     // OpenGL texture object
 float3 viewRotation    = make_float3(-12, -90, 0);
 float3 viewTranslation = make_float3(0.03, -0.05, -4.0);
 
-extern "C" void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, const Param& p);
+extern "C" void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, int spp, const Param& p);
 extern "C" void copy_inv_view_matrix(float *invViewMatrix, size_t sizeofMatrix);
 extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height);
 extern "C" void free_rng();
@@ -259,7 +259,7 @@ void cuda_volpath()
 
     // call CUDA kernel, writing results to PBO
     Timer timer;
-    render_kernel(gridSize, blockSize, fb->ptr(), P);
+    render_kernel(gridSize, blockSize, fb->ptr(), fb->samplesPerPixel(), P);
     checkCudaErrors(cudaDeviceSynchronize());
     float elapsed = timer.elapsed();
     printf("%f M samples / s, %d x %d, %f\n", (float)P.width * (float)P.height / elapsed, P.width, P.height, elapsed);
