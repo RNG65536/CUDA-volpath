@@ -1,21 +1,23 @@
-#include <iostream>
 #include <algorithm>
 #include <glm/glm.hpp>
-#include <glm/gtc/type_ptr.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <iostream>
 using std::cout;
 using std::endl;
 
 #include <GL/glew.h>
+//
 #include <GL/freeglut.h>
-#include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
-#include <vector_types.h>
-#include <vector_functions.h>
+#include <cuda_runtime.h>
 #include <helper_cuda.h>
 #include <helper_timer.h>
-#include <random>
+#include <vector_functions.h>
+#include <vector_types.h>
+
 #include <chrono>
+#include <random>
 
 #include "param.h"
 
@@ -27,15 +29,12 @@ std::vector<Param> params;
 
 bool linearFiltering = false;
 
-typedef unsigned int uint;
+typedef unsigned int  uint;
 typedef unsigned char uchar;
 
-static std::default_random_engine rng;
+static std::default_random_engine            rng;
 static std::uniform_real_distribution<float> dist;
-static float randf()
-{
-    return dist(rng);
-}
+static float                                 randf() { return dist(rng); }
 
 class Timer
 {
@@ -62,78 +61,60 @@ typedef unsigned char VolumeType;
 dim3 blockSize(8, 8);
 dim3 gridSize;
 
-GLuint pbo = 0;     // OpenGL pixel buffer object
-GLuint tex = 0;     // OpenGL texture object
+GLuint pbo = 0;  // OpenGL pixel buffer object
+GLuint tex = 0;  // OpenGL texture object
 
-//float3 viewRotation = make_float3(20, -20, 0);
-//float3 viewTranslation = make_float3(0.0, 0.0, -4.0f);
+// float3 viewRotation = make_float3(20, -20, 0);
+// float3 viewTranslation = make_float3(0.0, 0.0, -4.0f);
 float3 viewRotation    = make_float3(-12, -90, 0);
 float3 viewTranslation = make_float3(0.03, -0.05, -4.0);
 
-extern "C" void render_kernel(dim3 gridSize, dim3 blockSize, float4 *d_output, int spp, const Param& p);
-extern "C" void copy_inv_view_matrix(float *invViewMatrix, size_t sizeofMatrix);
+extern "C" void render_kernel(
+    dim3 gridSize, dim3 blockSize, float4* d_output, int spp, const Param& p);
+extern "C" void copy_inv_view_matrix(float* invViewMatrix, size_t sizeofMatrix);
 extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height);
 extern "C" void free_rng();
-extern "C" void scale(float4 *dst, float4 *src, int size, float scale);
-extern "C" void gamma_correct(float4 *dst, float4 *src, int size, float scale, float gamma);
+extern "C" void scale(float4* dst, float4* src, int size, float scale);
+extern "C" void gamma_correct(float4* dst, float4* src, int size, float scale, float gamma);
 
 namespace TextureVolume
 {
-extern "C" void init_cuda(void *h_volume, cudaExtent volumeSize);
+extern "C" void init_cuda(void* h_volume, cudaExtent volumeSize);
 extern "C" void set_texture_filter_mode(bool bLinearFilter);
 extern "C" void free_cuda_buffers();
-}
+}  // namespace TextureVolume
 
 void initPixelBuffer();
 
 class SdkTimer
 {
-    StopWatchInterface *timer = 0;
+    StopWatchInterface* timer = 0;
 
 public:
-    SdkTimer()
-    {
-        sdkCreateTimer(&timer);
+    SdkTimer() { sdkCreateTimer(&timer); }
+    ~SdkTimer() { sdkDeleteTimer(&timer); }
 
+    void start() { sdkStartTimer(&timer); }
 
-    }
-    ~SdkTimer()
-    {
-        sdkDeleteTimer(&timer);
-    }
+    void stop() { sdkStopTimer(&timer); }
 
-    void start()
-    {
-        sdkStartTimer(&timer);
-    }
+    float fps() { return 1.0f / (sdkGetAverageTimerValue(&timer) / 1000.0f); }
 
-    void stop()
-    {
-        sdkStopTimer(&timer);
-    }
-
-    float fps()
-    {
-        return 1.0f / (sdkGetAverageTimerValue(&timer) / 1000.0f);
-    }
-
-    void reset()
-    {
-        sdkResetTimer(&timer);
-    }
+    void reset() { sdkResetTimer(&timer); }
 };
 
 template <typename T>
 class PboResource
 {
-    struct cudaGraphicsResource *cuda_pbo_resource; // CUDA Graphics Resource (to transfer PBO)
-    bool mapped = false;
+    struct cudaGraphicsResource* cuda_pbo_resource;  // CUDA Graphics Resource (to transfer PBO)
+    bool                         mapped = false;
 
 public:
     PboResource(unsigned int pbo)
     {
         // register this buffer object with CUDA
-        checkCudaErrors(cudaGraphicsGLRegisterBuffer(&cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard));
+        checkCudaErrors(cudaGraphicsGLRegisterBuffer(
+            &cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard));
     }
     ~PboResource()
     {
@@ -144,15 +125,15 @@ public:
         // unregister this buffer object from CUDA C
         checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo_resource));
     }
-    T *map()
+    T* map()
     {
-        T *d_output;
+        T* d_output;
         // map PBO to get CUDA device pointer
         checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, 0));
         size_t num_bytes;
-        checkCudaErrors(cudaGraphicsResourceGetMappedPointer((void **)&d_output, &num_bytes,
-            cuda_pbo_resource));
-        //printf("CUDA mapped PBO: May access %ld bytes\n", num_bytes);
+        checkCudaErrors(
+            cudaGraphicsResourceGetMappedPointer((void**)&d_output, &num_bytes, cuda_pbo_resource));
+        // printf("CUDA mapped PBO: May access %ld bytes\n", num_bytes);
         mapped = true;
         return d_output;
     }
@@ -165,61 +146,46 @@ public:
 };
 //////////////////////////////////////////////////////////////////////////
 
-SdkTimer timer;
-PboResource<float4> *resource = nullptr;
-Param P;
+SdkTimer             timer;
+PboResource<float4>* resource = nullptr;
+Param                P;
 
 class CudaFrameBuffer
 {
-    int width, height;
-    int spp = 0;
-    float4 *sum_buffer;
+    int     width, height;
+    int     spp = 0;
+    float4* sum_buffer;
 
 public:
     CudaFrameBuffer(int w, int h)
     {
-        width = w;
+        width  = w;
         height = h;
         checkCudaErrors(cudaMalloc((void**)&sum_buffer, width * height * sizeof(float4)));
         // clear image
         checkCudaErrors(cudaMemset(sum_buffer, 0, width * height * sizeof(float4)));
     }
-    ~CudaFrameBuffer()
-    {
-        checkCudaErrors(cudaFree(sum_buffer));
-    }
+    ~CudaFrameBuffer() { checkCudaErrors(cudaFree(sum_buffer)); }
     void reset()
     {
         spp = 0;
         // clear image
         checkCudaErrors(cudaMemset(sum_buffer, 0, width * height * sizeof(float4)));
     }
-    float4 *ptr()
-    {
-        return sum_buffer;
-    }
-    void incrementSPP()
-    {
-        spp++;
-    }
-    void scaledOutput(float4 *dst)
-    {
-        scale(dst, sum_buffer, width * height, 1.0f / spp);
-    }
-    void gammaCorrectedOutput(float4 *dst, float gamma)
+    float4* ptr() { return sum_buffer; }
+    void    incrementSPP() { spp++; }
+    void    scaledOutput(float4* dst) { scale(dst, sum_buffer, width * height, 1.0f / spp); }
+    void    gammaCorrectedOutput(float4* dst, float gamma)
     {
         gamma_correct(dst, sum_buffer, width * height, 1.0f / spp, gamma);
     }
-    int samplesPerPixel() const
-    {
-        return spp;
-    }
+    int samplesPerPixel() const { return spp; }
 };
 
-CudaFrameBuffer *fb = nullptr;
+CudaFrameBuffer* fb = nullptr;
 
-int fpsCount = 0;        // FPS count for averaging
-int fpsLimit = 1;        // FPS limit for sampling
+int          fpsCount   = 0;  // FPS count for averaging
+int          fpsLimit   = 1;  // FPS limit for sampling
 unsigned int frameCount = 0;
 
 void computeFPS()
@@ -229,7 +195,7 @@ void computeFPS()
 
     if (fpsCount == fpsLimit)
     {
-        char fps[256];
+        char  fps[256];
         float ifps = timer.fps();
         sprintf(fps, "Volume Render: %3.1f fps @ %d spp", ifps, fb->samplesPerPixel());
 
@@ -241,31 +207,35 @@ void computeFPS()
     }
 }
 
-
 // render image using CUDA
 void cuda_volpath()
 {
     // build inverse view matrix and convert to row major
     glm::mat4 model = glm::mat4(1.0f);
-    model = glm::rotate(model, glm::radians(-viewRotation.y), glm::vec3(0.0, 1.0, 0.0));
-    model = glm::rotate(model, glm::radians(-viewRotation.x), glm::vec3(1.0, 0.0, 0.0));
-    model = glm::translate(model, glm::vec3(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z));
-    model = glm::transpose(model);
+    model           = glm::rotate(model, glm::radians(-viewRotation.y), glm::vec3(0.0, 1.0, 0.0));
+    model           = glm::rotate(model, glm::radians(-viewRotation.x), glm::vec3(1.0, 0.0, 0.0));
+    model           = glm::translate(model,
+                           glm::vec3(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z));
+    model           = glm::transpose(model);
 
-    copy_inv_view_matrix(glm::value_ptr(model), sizeof(float4)*3);
+    copy_inv_view_matrix(glm::value_ptr(model), sizeof(float4) * 3);
 
     // map PBO to get CUDA device pointer
-    float4 *d_output = resource->map();
+    float4* d_output = resource->map();
 
     // call CUDA kernel, writing results to PBO
     Timer timer;
     render_kernel(gridSize, blockSize, fb->ptr(), fb->samplesPerPixel(), P);
     checkCudaErrors(cudaDeviceSynchronize());
     float elapsed = timer.elapsed();
-    printf("%f M samples / s, %d x %d, %f\n", (float)P.width * (float)P.height / elapsed, P.width, P.height, elapsed);
+    printf("%f M samples / s, %d x %d, %f\n",
+           (float)P.width * (float)P.height / elapsed,
+           P.width,
+           P.height,
+           elapsed);
 
     fb->incrementSPP();
-    //fb->scaledOutput(d_output);
+    // fb->scaledOutput(d_output);
     fb->gammaCorrectedOutput(d_output, 2.2f);
 
     getLastCudaError("kernel failed");
@@ -318,10 +288,7 @@ void display()
     computeFPS();
 }
 
-void idle()
-{
-    glutPostRedisplay();
-}
+void idle() { glutPostRedisplay(); }
 
 void keyboard(unsigned char key, int x, int y)
 {
@@ -399,7 +366,7 @@ void mouse(int button, int state, int x, int y)
 {
     if (state == GLUT_DOWN)
     {
-        buttonState  |= 1<<button;
+        buttonState |= 1 << button;
     }
     else if (state == GLUT_UP)
     {
@@ -444,14 +411,11 @@ void motion(int x, int y)
     fb->reset();
 }
 
-int divideUp(int a, int b)
-{
-    return (a + b - 1) / b;
-}
+int divideUp(int a, int b) { return (a + b - 1) / b; }
 
 void reshape(int w, int h)
 {
-    P.width = w;
+    P.width  = w;
     P.height = h;
     initPixelBuffer();
 
@@ -511,11 +475,12 @@ void initPixelBuffer()
     // create pixel buffer object for display
     glGenBuffers(1, &pbo);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, P.width * P.height * sizeof(GLfloat) * 4, 0, GL_STREAM_DRAW);
+    glBufferData(
+        GL_PIXEL_UNPACK_BUFFER, P.width * P.height * sizeof(GLfloat) * 4, 0, GL_STREAM_DRAW);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
     resource = new PboResource<float4>(pbo);
-    fb = new CudaFrameBuffer(P.width, P.height);
+    fb       = new CudaFrameBuffer(P.width, P.height);
 
     // create texture for display
     glGenTextures(1, &tex);
@@ -527,9 +492,9 @@ void initPixelBuffer()
 }
 
 // Load raw data from disk
-void *loadRawFile(char *filename, size_t size)
+void* loadRawFile(char* filename, size_t size)
 {
-    FILE *fp = fopen(filename, "rb");
+    FILE* fp = fopen(filename, "rb");
 
     if (!fp)
     {
@@ -537,7 +502,7 @@ void *loadRawFile(char *filename, size_t size)
         return nullptr;
     }
 
-    void *data = malloc(size);
+    void*  data = malloc(size);
     size_t read = fread(data, 1, size, fp);
     fclose(fp);
 
@@ -546,9 +511,9 @@ void *loadRawFile(char *filename, size_t size)
     return data;
 }
 
-void* loadBinaryFile(char* filename, int &width, int &height, int &depth)
+void* loadBinaryFile(char* filename, int& width, int& height, int& depth)
 {
-    FILE *fp = fopen(filename, "rb");
+    FILE* fp = fopen(filename, "rb");
     if (!fp)
     {
         fclose(fp);
@@ -576,7 +541,7 @@ void* loadBinaryFile(char* filename, int &width, int &height, int &depth)
     }
 
     float* dataf = reinterpret_cast<float*>(malloc(sizeof(float) * total));
-    size_t read = fread(dataf, sizeof(float), width * height * depth, fp);
+    size_t read  = fread(dataf, sizeof(float), width * height * depth, fp);
     fclose(fp);
     printf("Read '%s', %zu bytes\n", filename, read);
 
@@ -603,8 +568,8 @@ void* loadVdbFile(char* filename, int& width, int& height, int& depth)
     fclose(f);
 
     float min_value, max_value;
-    auto dataf = load_vdb(filename, width, height, depth, min_value, max_value);
-    max_value = std::max(max_value, 0.0001f);
+    auto  dataf = load_vdb(filename, width, height, depth, min_value, max_value);
+    max_value   = std::max(max_value, 0.0001f);
 
     if (!dataf)
     {
@@ -632,7 +597,7 @@ void* loadVdbFile(char* filename, int& width, int& height, int& depth)
     VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
     for (size_t i = 0; i < total; i++)
     {
-        //data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+        // data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
         data[i] = VolumeType(std::max(0.0f, dataf[i]) / max_value * 255.0f);
     }
     free(dataf);
@@ -723,7 +688,7 @@ Data2* compute_volume_value_bound_(const Data*       volume,
     int diffusion_iters = ceil(search_radius / cell_size);
     printf_s("diffusion iters = %d\n", diffusion_iters);
 
-    constexpr size_t buffer_size = 256; // must be larger than diffusion_iters * 2 + 1
+    constexpr size_t buffer_size = 256;  // must be larger than diffusion_iters * 2 + 1
 
     int nx  = extent.width;
     int ny  = extent.height;
@@ -744,124 +709,145 @@ Data2* compute_volume_value_bound_(const Data*       volume,
     {
         switch (sweep_dir)
         {
-        default:
-            break;
-        case 0:
-            timer.record();
+            default:
+                break;
+            case 0:
+                timer.record();
 
 #pragma omp parallel for
-            for (int k = 0; k < nz; k++)
-            for (int j = 0; j < ny; j++)
-            {
-                CircularBuffer<int, buffer_size> max_window;
-                CircularBuffer<int, buffer_size> min_window;
-                size_t offset = j * nx + k * nxy;
-                for (int i = 0; i < nx + diffusion_iters + 1; i++)
-                {
-                    if (i > diffusion_iters)
+                for (int k = 0; k < nz; k++)
+                    for (int j = 0; j < ny; j++)
                     {
-                        Data dmax = bound_volume[max_window.front() + offset].x;
-                        Data dmin = bound_volume[min_window.front() + offset].y;
-                        bound_volume_2[(i - diffusion_iters - 1) + offset] = make<Data, Data2>(dmax, dmin);
+                        CircularBuffer<int, buffer_size> max_window;
+                        CircularBuffer<int, buffer_size> min_window;
+                        size_t                           offset = j * nx + k * nxy;
+                        for (int i = 0; i < nx + diffusion_iters + 1; i++)
+                        {
+                            if (i > diffusion_iters)
+                            {
+                                Data dmax = bound_volume[max_window.front() + offset].x;
+                                Data dmin = bound_volume[min_window.front() + offset].y;
+                                bound_volume_2[(i - diffusion_iters - 1) + offset] =
+                                    make<Data, Data2>(dmax, dmin);
+                            }
+                            if (i < nx)
+                            {
+                                Data2 d = bound_volume[i + offset];
+                                while (!max_window.empty() &&
+                                       d.x > bound_volume[max_window.back() + offset].x)
+                                    max_window.pop_back();
+                                while (!min_window.empty() &&
+                                       d.y < bound_volume[min_window.back() + offset].y)
+                                    min_window.pop_back();
+                            }
+                            if (!max_window.empty() && max_window.front() <= i - (window_size))
+                                max_window.pop_front();
+                            if (!min_window.empty() && min_window.front() <= i - (window_size))
+                                min_window.pop_front();
+                            if (i < nx)
+                            {
+                                max_window.push_back(i);
+                                min_window.push_back(i);
+                            }
+                        }
                     }
-                    if (i < nx)
-                    {
-                        Data2 d = bound_volume[i + offset];
-                        while (!max_window.empty() && d.x > bound_volume[max_window.back() + offset].x) max_window.pop_back();
-                        while (!min_window.empty() && d.y < bound_volume[min_window.back() + offset].y) min_window.pop_back();
-                    }
-                    if (!max_window.empty() && max_window.front() <= i - (window_size)) max_window.pop_front();
-                    if (!min_window.empty() && min_window.front() <= i - (window_size)) min_window.pop_front();
-                    if (i < nx)
-                    {
-                        max_window.push_back(i);
-                        min_window.push_back(i);
-                    }
-                }
-            }
 
-            elapsed = timer.elapsed();
-            printf_s("sweeping x took %f us\n", elapsed);
-            break;
-        case 1:
-            timer.record();
-
-#pragma omp parallel for
-            for (int k = 0; k < nz; k++)
-            for (int i = 0; i < nx; i++)
-            {
-                CircularBuffer<int, buffer_size> max_window;
-                CircularBuffer<int, buffer_size> min_window;
-                size_t offset = i + k * nxy;
-                for (int j = 0; j < ny + diffusion_iters + 1; j++)
-                {
-                    if (j > diffusion_iters)
-                    {
-                        Data dmax = bound_volume[max_window.front() * nx + offset].x;
-                        Data dmin = bound_volume[min_window.front() * nx + offset].y;
-                        bound_volume_2[(j - diffusion_iters - 1) * nx + offset] = make<Data, Data2>(dmax, dmin);
-                    }
-                    if (j < ny)
-                    {
-                        Data2 d = bound_volume[j * nx + offset];
-                        while (!max_window.empty() && d.x > bound_volume[max_window.back() * nx + offset].x) max_window.pop_back();
-                        while (!min_window.empty() && d.y < bound_volume[min_window.back() * nx + offset].y) min_window.pop_back();
-                    }
-                    if (!max_window.empty() && max_window.front() <= j - (window_size)) max_window.pop_front();
-                    if (!min_window.empty() && min_window.front() <= j - (window_size)) min_window.pop_front();
-                    if (j < ny)
-                    {
-                        max_window.push_back(j);
-                        min_window.push_back(j);
-                    }
-                }
-            }
-
-            elapsed = timer.elapsed();
-            printf_s("sweeping y took %f us\n", elapsed);
-            break;
-        case 2:
-            timer.record();
+                elapsed = timer.elapsed();
+                printf_s("sweeping x took %f us\n", elapsed);
+                break;
+            case 1:
+                timer.record();
 
 #pragma omp parallel for
-            for (int j = 0; j < ny; j++)
-            for (int i = 0; i < nx; i++)
-            {
-                CircularBuffer<int, buffer_size> max_window;
-                CircularBuffer<int, buffer_size> min_window;
-                size_t offset = i + j * nx;
-                for (int k = 0; k < nz + diffusion_iters + 1; k++)
-                {
-                    if (k > diffusion_iters)
+                for (int k = 0; k < nz; k++)
+                    for (int i = 0; i < nx; i++)
                     {
-                        Data dmax = bound_volume[max_window.front() * nxy + offset].x;
-                        Data dmin = bound_volume[min_window.front() * nxy + offset].y;
-                        bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] = make<Data, Data2>(dmax, dmin);
+                        CircularBuffer<int, buffer_size> max_window;
+                        CircularBuffer<int, buffer_size> min_window;
+                        size_t                           offset = i + k * nxy;
+                        for (int j = 0; j < ny + diffusion_iters + 1; j++)
+                        {
+                            if (j > diffusion_iters)
+                            {
+                                Data dmax = bound_volume[max_window.front() * nx + offset].x;
+                                Data dmin = bound_volume[min_window.front() * nx + offset].y;
+                                bound_volume_2[(j - diffusion_iters - 1) * nx + offset] =
+                                    make<Data, Data2>(dmax, dmin);
+                            }
+                            if (j < ny)
+                            {
+                                Data2 d = bound_volume[j * nx + offset];
+                                while (!max_window.empty() &&
+                                       d.x > bound_volume[max_window.back() * nx + offset].x)
+                                    max_window.pop_back();
+                                while (!min_window.empty() &&
+                                       d.y < bound_volume[min_window.back() * nx + offset].y)
+                                    min_window.pop_back();
+                            }
+                            if (!max_window.empty() && max_window.front() <= j - (window_size))
+                                max_window.pop_front();
+                            if (!min_window.empty() && min_window.front() <= j - (window_size))
+                                min_window.pop_front();
+                            if (j < ny)
+                            {
+                                max_window.push_back(j);
+                                min_window.push_back(j);
+                            }
+                        }
                     }
-                    if (k < nz)
-                    {
-                        Data2 d = bound_volume[k * nxy + offset];
-                        while (!max_window.empty() && d.x > bound_volume[max_window.back() * nxy + offset].x) max_window.pop_back();
-                        while (!min_window.empty() && d.y < bound_volume[min_window.back() * nxy + offset].y) min_window.pop_back();
-                    }
-                    if (!max_window.empty() && max_window.front() <= k - (window_size)) max_window.pop_front();
-                    if (!min_window.empty() && min_window.front() <= k - (window_size)) min_window.pop_front();
-                    if (k < nz)
-                    {
-                        max_window.push_back(k);
-                        min_window.push_back(k);
-                    }
-                }
-            }
 
-            elapsed = timer.elapsed();
-            printf_s("sweeping z took %f us\n", elapsed);
-            break;
+                elapsed = timer.elapsed();
+                printf_s("sweeping y took %f us\n", elapsed);
+                break;
+            case 2:
+                timer.record();
+
+#pragma omp parallel for
+                for (int j = 0; j < ny; j++)
+                    for (int i = 0; i < nx; i++)
+                    {
+                        CircularBuffer<int, buffer_size> max_window;
+                        CircularBuffer<int, buffer_size> min_window;
+                        size_t                           offset = i + j * nx;
+                        for (int k = 0; k < nz + diffusion_iters + 1; k++)
+                        {
+                            if (k > diffusion_iters)
+                            {
+                                Data dmax = bound_volume[max_window.front() * nxy + offset].x;
+                                Data dmin = bound_volume[min_window.front() * nxy + offset].y;
+                                bound_volume_2[(k - diffusion_iters - 1) * nxy + offset] =
+                                    make<Data, Data2>(dmax, dmin);
+                            }
+                            if (k < nz)
+                            {
+                                Data2 d = bound_volume[k * nxy + offset];
+                                while (!max_window.empty() &&
+                                       d.x > bound_volume[max_window.back() * nxy + offset].x)
+                                    max_window.pop_back();
+                                while (!min_window.empty() &&
+                                       d.y < bound_volume[min_window.back() * nxy + offset].y)
+                                    min_window.pop_back();
+                            }
+                            if (!max_window.empty() && max_window.front() <= k - (window_size))
+                                max_window.pop_front();
+                            if (!min_window.empty() && min_window.front() <= k - (window_size))
+                                min_window.pop_front();
+                            if (k < nz)
+                            {
+                                max_window.push_back(k);
+                                min_window.push_back(k);
+                            }
+                        }
+                    }
+
+                elapsed = timer.elapsed();
+                printf_s("sweeping z took %f us\n", elapsed);
+                break;
         }
 
         std::swap(bound_volume, bound_volume_2);
     }
-    
+
     delete[] bound_volume_2;
 
     return bound_volume;
@@ -871,15 +857,13 @@ uchar2* compute_volume_value_bound(const unsigned char* volume,
                                    const cudaExtent&    extent,
                                    float                search_radius)
 {
-    return compute_volume_value_bound_<unsigned char, uchar2>(
-        volume, extent, search_radius);
+    return compute_volume_value_bound_<unsigned char, uchar2>(volume, extent, search_radius);
 }
 float2* compute_volume_value_bound(const float*      volume,
                                    const cudaExtent& extent,
                                    float             search_radius)
 {
-    return compute_volume_value_bound_<float, float2>(
-        volume, extent, search_radius);
+    return compute_volume_value_bound_<float, float2>(volume, extent, search_radius);
 }
 #endif
 
@@ -925,7 +909,7 @@ int main(int argc, char** argv)
         Mat(P, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
     }
 
-    //start logs
+    // start logs
     printf("%s Starting...\n\n", sSDKsample);
 
     // First initialize OpenGL context, so we can properly set the GL for CUDA.
@@ -944,21 +928,22 @@ int main(int argc, char** argv)
         exit(EXIT_SUCCESS);
     }
 
-    int        width, height, depth;
-    #if USE_OPENVDB
-    char* vdb_name = "../wdas_cloud_quarter.vdb";
-    void* h_volume = loadVdbFile(vdb_name, width, height, depth);
+    int width, height, depth;
+#if USE_OPENVDB
+    char*      vdb_name   = "../wdas_cloud_quarter.vdb";
+    void*      h_volume   = loadVdbFile(vdb_name, width, height, depth);
     cudaExtent volumeSize = make_cudaExtent(width, height, depth);
     TextureVolume::init_cuda(h_volume, volumeSize);
     free(h_volume);
     TextureVolume::set_texture_filter_mode(linearFiltering);
-    #else
+#else
     cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
     TextureVolume::init_cuda(nullptr, volumeSize);
-    #endif
+#endif
 
-    printf("Press '+' and '-' to change density (0.01 increments)\n"
-           "      ']' and '[' to change brightness\n");
+    printf(
+        "Press '+' and '-' to change density (0.01 increments)\n"
+        "      ']' and '[' to change brightness\n");
 
     // calculate new grid size
     gridSize = dim3(divideUp(P.width, blockSize.x), divideUp(P.height, blockSize.y));
