@@ -12,13 +12,18 @@ using std::endl;
 #include <cuda_gl_interop.h>
 #include <cuda_runtime.h>
 #include <helper_cuda.h>
+#include <helper_math.h>
 #include <helper_timer.h>
 #include <vector_functions.h>
 #include <vector_types.h>
 
 #include <chrono>
+#include <deque>
 #include <random>
+#include <thread>
+using namespace std::chrono_literals;
 
+#include "image.h"
 #include "param.h"
 
 #if USE_OPENVDB
@@ -27,10 +32,38 @@ using std::endl;
 
 std::vector<Param> params;
 
+// sigma_s, sigma_a
+void Mat(Param& P, float X, float Y, float Z, float R, float G, float B)
+{
+    P.sigma_t.x = ((X) + (R));
+    P.sigma_t.y = ((Y) + (G));
+    P.sigma_t.z = ((Z) + (B));
+    P.albedo.x  = (X) / P.sigma_t.x;
+    P.albedo.y  = (Y) / P.sigma_t.y;
+    P.albedo.z  = (Z) / P.sigma_t.z;
+    float f     = std::max(std::max(P.sigma_t.x, P.sigma_t.y), P.sigma_t.z);
+    P.sigma_t.x /= f;
+    P.sigma_t.y /= f;
+    P.sigma_t.z /= f;
+    params.push_back(P);
+}
+
 bool linearFiltering = false;
 
 typedef unsigned int  uint;
 typedef unsigned char uchar;
+
+static bool exists(const char* filename)
+{
+    FILE* f = fopen(filename, "r");
+    if (!f)
+        return false;
+    else
+    {
+        fclose(f);
+        return true;
+    }
+}
 
 static std::default_random_engine            rng;
 static std::uniform_real_distribution<float> dist;
@@ -69,9 +102,19 @@ GLuint tex = 0;  // OpenGL texture object
 float3 viewRotation    = make_float3(-12, -90, 0);
 float3 viewTranslation = make_float3(0.03, -0.05, -4.0);
 
+glm::vec3 cam_position   = glm::vec3(3.922986, -0.782739, 0.030000);
+glm::vec3 cam_forward    = glm::vec3(-0.978148, 0.207912, 0.000000);
+glm::vec3 cam_right      = glm::vec3(-0.000000, 0.000000, -1.000000);
+glm::vec3 cam_up         = glm::vec3(0.207912, 0.978148, -0.000000);
+float     cam_focus_dist = 4.0f;
+glm::mat4 cam_view;
+glm::mat4 cam_inv_view;
+bool      cam_update = true;
+
 extern "C" void render_kernel(
     dim3 gridSize, dim3 blockSize, float4* d_output, int spp, const Param& p);
 extern "C" void copy_inv_view_matrix(float* invViewMatrix, size_t sizeofMatrix);
+extern "C" void copy_inv_model_matrix(float* invModelMatrix, size_t sizeofMatrix);
 extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height);
 extern "C" void free_rng();
 extern "C" void scale(float4* dst, float4* src, int size, float scale);
@@ -79,7 +122,11 @@ extern "C" void gamma_correct(float4* dst, float4* src, int size, float scale, f
 
 namespace TextureVolume
 {
-extern "C" void init_cuda(void* h_volume, cudaExtent volumeSize);
+extern "C" void init_cuda(void*         h_volume,
+                          cudaExtent    volumeSize,
+                          bool          quantized,
+                          const float3* boxmin,
+                          const float3* boxmax);
 extern "C" void set_texture_filter_mode(bool bLinearFilter);
 extern "C" void free_cuda_buffers();
 }  // namespace TextureVolume
@@ -114,7 +161,7 @@ public:
     {
         // register this buffer object with CUDA
         checkCudaErrors(cudaGraphicsGLRegisterBuffer(
-            &cuda_pbo_resource, pbo, cudaGraphicsMapFlagsWriteDiscard));
+            &cuda_pbo_resource, pbo, cudaGraphicsRegisterFlagsWriteDiscard));
     }
     ~PboResource()
     {
@@ -152,34 +199,36 @@ Param                P;
 
 class CudaFrameBuffer
 {
-    int     width, height;
+    int     _width, _height;
     int     spp = 0;
     float4* sum_buffer;
 
 public:
     CudaFrameBuffer(int w, int h)
     {
-        width  = w;
-        height = h;
-        checkCudaErrors(cudaMalloc((void**)&sum_buffer, width * height * sizeof(float4)));
+        _width  = w;
+        _height = h;
+        checkCudaErrors(cudaMalloc((void**)&sum_buffer, _width * _height * sizeof(float4)));
         // clear image
-        checkCudaErrors(cudaMemset(sum_buffer, 0, width * height * sizeof(float4)));
+        checkCudaErrors(cudaMemset(sum_buffer, 0, _width * _height * sizeof(float4)));
     }
     ~CudaFrameBuffer() { checkCudaErrors(cudaFree(sum_buffer)); }
     void reset()
     {
         spp = 0;
         // clear image
-        checkCudaErrors(cudaMemset(sum_buffer, 0, width * height * sizeof(float4)));
+        checkCudaErrors(cudaMemset(sum_buffer, 0, _width * _height * sizeof(float4)));
     }
     float4* ptr() { return sum_buffer; }
     void    incrementSPP() { spp++; }
-    void    scaledOutput(float4* dst) { scale(dst, sum_buffer, width * height, 1.0f / spp); }
+    void    scaledOutput(float4* dst) { scale(dst, sum_buffer, _width * _height, 1.0f / spp); }
     void    gammaCorrectedOutput(float4* dst, float gamma)
     {
-        gamma_correct(dst, sum_buffer, width * height, 1.0f / spp, gamma);
+        gamma_correct(dst, sum_buffer, _width * _height, 1.0f / spp, gamma);
     }
     int samplesPerPixel() const { return spp; }
+    int width() const { return _width; }
+    int height() const { return _height; }
 };
 
 CudaFrameBuffer* fb = nullptr;
@@ -207,18 +256,45 @@ void computeFPS()
     }
 }
 
+void capture(bool use_denoiser = false)
+{
+    static int  i = 0;
+    std::string filename;
+    do
+    {
+        filename = "output" + std::to_string(i) + ".hdr";
+        ++i;
+    } while (exists(filename.c_str()));
+
+    Image image(fb->width(), fb->height());
+
+    float4* d_output = resource->map();
+    fb->scaledOutput(d_output);
+    cudaMemcpy(image.buffer(),
+               d_output,
+               sizeof(float4) * image.width() * image.height(),
+               cudaMemcpyDeviceToHost);
+    resource->unmap();
+
+    // image.flip_updown();
+    image.dump_hdr(filename.c_str());
+    filename += ".ppm";
+    image.tonemap_gamma(2.2f);
+    image.dump_ppm(filename.c_str());
+}
+
 // render image using CUDA
 void cuda_volpath()
 {
-    // build inverse view matrix and convert to row major
-    glm::mat4 model = glm::mat4(1.0f);
-    model           = glm::rotate(model, glm::radians(-viewRotation.y), glm::vec3(0.0, 1.0, 0.0));
-    model           = glm::rotate(model, glm::radians(-viewRotation.x), glm::vec3(1.0, 0.0, 0.0));
-    model           = glm::translate(model,
-                           glm::vec3(-viewTranslation.x, -viewTranslation.y, -viewTranslation.z));
-    model           = glm::transpose(model);
+    if (cam_update)
+    {
+        cam_view = glm::lookAt(cam_position, cam_position + cam_forward * cam_focus_dist, cam_up);
+        cam_inv_view    = glm::inverse(cam_view);
+        glm::mat4 model = glm::transpose(cam_inv_view);  // convert to row major
 
-    copy_inv_view_matrix(glm::value_ptr(model), sizeof(float4) * 3);
+        copy_inv_view_matrix(glm::value_ptr(model), sizeof(float4) * 3);
+        cam_update = false;
+    }
 
     // map PBO to get CUDA device pointer
     float4* d_output = resource->map();
@@ -235,11 +311,12 @@ void cuda_volpath()
            elapsed);
 
     fb->incrementSPP();
-    // fb->scaledOutput(d_output);
-    fb->gammaCorrectedOutput(d_output, 2.2f);
+
+    {
+        fb->gammaCorrectedOutput(d_output, 2.2f);
+    }
 
     getLastCudaError("kernel failed");
-
     resource->unmap();
 }
 
@@ -292,6 +369,8 @@ void idle() { glutPostRedisplay(); }
 
 void keyboard(unsigned char key, int x, int y)
 {
+    bool need_reset = false;
+
     switch (key)
     {
         case 27:
@@ -302,50 +381,69 @@ void keyboard(unsigned char key, int x, int y)
         case 'f':
             linearFiltering = !linearFiltering;
             TextureVolume::set_texture_filter_mode(linearFiltering);
+            need_reset = true;
             break;
 
         case '+':
         case '=':
             P.density += 1;
+            need_reset = true;
             break;
 
         case '-':
             P.density -= 1;
-            P.density = std::max(P.density, 0.0f);
+            P.density  = std::max(P.density, 0.0f);
+            need_reset = true;
             break;
 
         case ']':
             P.brightness += 0.1f;
+            need_reset = true;
             break;
 
         case '[':
             P.brightness -= 0.1f;
+            need_reset = true;
             break;
 
         case 'x':
             P.albedo.x = std::max(0.0f, std::min(P.albedo.x + 0.01f, 1.0f));
             P.albedo.y = std::max(0.0f, std::min(P.albedo.y + 0.01f, 1.0f));
             P.albedo.z = std::max(0.0f, std::min(P.albedo.z + 0.01f, 1.0f));
+            need_reset = true;
             break;
 
         case 'z':
             P.albedo.x = std::max(0.0f, std::min(P.albedo.x - 0.01f, 1.0f));
             P.albedo.y = std::max(0.0f, std::min(P.albedo.y - 0.01f, 1.0f));
             P.albedo.z = std::max(0.0f, std::min(P.albedo.z - 0.01f, 1.0f));
+            need_reset = true;
             break;
 
         case 's':
             P.g += 0.01;
-            P.g = std::max(-1.0f, std::min(P.g, 1.0f));
+            P.g        = std::max(-1.0f, std::min(P.g, 1.0f));
+            need_reset = true;
             break;
 
         case 'a':
             P.g -= 0.01;
-            P.g = std::max(-1.0f, std::min(P.g, 1.0f));
+            P.g        = std::max(-1.0f, std::min(P.g, 1.0f));
+            need_reset = true;
             break;
 
         case ' ':
-            P = params[rand() % params.size()];
+            P          = params[rand() % params.size()];
+            need_reset = true;
+            break;
+
+        case 'r':
+            Mat(P, randf(), randf(), randf(), randf(), randf(), randf());
+            need_reset = true;
+            break;
+
+        case 'c':
+            capture();
             break;
 
         default:
@@ -356,7 +454,7 @@ void keyboard(unsigned char key, int x, int y)
     printf("albedo = %.2f, %.2f, %.2f, g = %.2f\n", P.albedo.x, P.albedo.y, P.albedo.z, P.g);
     glutPostRedisplay();
 
-    fb->reset();
+    if (need_reset) fb->reset();
 }
 
 int ox, oy;
@@ -389,20 +487,33 @@ void motion(int x, int y)
     if (buttonState == 4)
     {
         // middle = translate
-        viewTranslation.x += dx / 100.0f;
-        viewTranslation.y -= dy / 100.0f;
+        cam_position -= cam_right * dx / 1000.0f * cam_focus_dist;
+        cam_position += cam_up * dy / 1000.0f * cam_focus_dist;
     }
     else if (buttonState == 2)
     {
         // right = zoom
-        viewTranslation.z += dy / 100.0f;
+        glm::vec3 center = cam_position + cam_forward * cam_focus_dist;
+        cam_focus_dist += dy / 100.0f;
+        cam_position = center - cam_forward * cam_focus_dist;
     }
     else if (buttonState == 1)
     {
         // left = rotate
-        viewRotation.x += dy / 5.0f;
-        viewRotation.y += dx / 5.0f;
+        glm::vec3 center = cam_position + cam_forward * cam_focus_dist;
+
+        glm::mat4 R = glm::mat4(1.0f);
+        R           = glm::rotate(R, glm::radians(-dx / 5), cam_up);
+        R           = glm::rotate(R, glm::radians(-dy / 5), cam_right);
+        glm::mat3 r = glm::mat3(R);
+
+        cam_forward = r * cam_forward;
+        cam_right   = r * cam_right;
+        cam_up      = r * cam_up;
+
+        cam_position = center - cam_forward * cam_focus_dist;
     }
+    cam_update = true;
 
     ox = x;
     oy = y;
@@ -511,7 +622,7 @@ void* loadRawFile(char* filename, size_t size)
     return data;
 }
 
-void* loadBinaryFile(char* filename, int& width, int& height, int& depth)
+void* loadBinaryFile(char* filename, int& width, int& height, int& depth, bool quantized = true)
 {
     FILE* fp = fopen(filename, "rb");
     if (!fp)
@@ -546,26 +657,31 @@ void* loadBinaryFile(char* filename, int& width, int& height, int& depth)
     printf("Read '%s', %zu bytes\n", filename, read);
 
     // normalize the volume values
-    VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
-    for (size_t i = 0; i < total; i++)
+    if (quantized)
     {
-        data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
-    }
-    free(dataf);
+        VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
+        for (size_t i = 0; i < total; i++)
+        {
+            data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+        }
+        free(dataf);
 
-    return data;
+        return data;
+    }
+    else
+    {
+        return dataf;
+    }
 }
 
 #if USE_OPENVDB
-void* loadVdbFile(char* filename, int& width, int& height, int& depth)
+void* loadVdbFile(char* filename, int& width, int& height, int& depth, bool quantized = true)
 {
-    FILE* f = fopen(filename, "r");
-    if (!f)
+    if (!exists(filename))
     {
-        fprintf(stderr, "cannot open file: %s\n", filename);
-        exit(1);
+        fprintf(stderr, "Error opening file '%s'\n", filename);
+        return nullptr;
     }
-    fclose(f);
 
     float min_value, max_value;
     auto  dataf = load_vdb(filename, width, height, depth, min_value, max_value);
@@ -594,15 +710,22 @@ void* loadVdbFile(char* filename, int& width, int& height, int& depth)
     }
 
     // normalize the volume values
-    VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
-    for (size_t i = 0; i < total; i++)
+    if (quantized)
     {
-        // data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
-        data[i] = VolumeType(std::max(0.0f, dataf[i]) / max_value * 255.0f);
-    }
-    free(dataf);
+        VolumeType* data = reinterpret_cast<VolumeType*>(malloc(total));
+        for (size_t i = 0; i < total; i++)
+        {
+            // data[i] = VolumeType(std::max(0.0f, std::min(dataf[i], 1.0f)) * 255.0f);
+            data[i] = VolumeType(std::max(0.0f, dataf[i]) / max_value * 255.0f);
+        }
+        free(dataf);
 
-    return data;
+        return data;
+    }
+    else
+    {
+        return dataf;
+    }
 }
 
 template <typename T, int MaxSize>
@@ -865,22 +988,8 @@ float2* compute_volume_value_bound(const float*      volume,
 {
     return compute_volume_value_bound_<float, float2>(volume, extent, search_radius);
 }
-#endif
 
-void Mat(Param& P, float X, float Y, float Z, float R, float G, float B)
-{
-    P.sigma_t.x = ((X) + (R));
-    P.sigma_t.y = ((Y) + (G));
-    P.sigma_t.z = ((Z) + (B));
-    P.albedo.x  = (X) / P.sigma_t.x;
-    P.albedo.y  = (Y) / P.sigma_t.y;
-    P.albedo.z  = (Z) / P.sigma_t.z;
-    float f     = std::max(std::max(P.sigma_t.x, P.sigma_t.y), P.sigma_t.z);
-    P.sigma_t.x /= f;
-    P.sigma_t.y /= f;
-    P.sigma_t.z /= f;
-    params.push_back(P);
-}
+#endif
 
 int main(int argc, char** argv)
 {
@@ -930,20 +1039,28 @@ int main(int argc, char** argv)
 
     int width, height, depth;
 #if USE_OPENVDB
-    char*      vdb_name   = "../wdas_cloud_quarter.vdb";
-    void*      h_volume   = loadVdbFile(vdb_name, width, height, depth);
+    bool  quantized = true;  // true for uchar texture
+    char* vdb_name  = "../wdas_cloud_quarter.vdb";
+    void* h_volume  = loadVdbFile(vdb_name, width, height, depth, quantized);
+
+    float3 scale = make_float3(width, height, depth);
+    scale /= width;
+    float3 box_min = make_float3(-1.0f) * scale;
+    float3 box_max = make_float3(1.0f) * scale;
+
     cudaExtent volumeSize = make_cudaExtent(width, height, depth);
-    TextureVolume::init_cuda(h_volume, volumeSize);
+    TextureVolume::init_cuda(h_volume, volumeSize, quantized, &box_min, &box_max);
     free(h_volume);
     TextureVolume::set_texture_filter_mode(linearFiltering);
 #else
     cudaExtent volumeSize = make_cudaExtent(32, 32, 32);
-    TextureVolume::init_cuda(nullptr, volumeSize);
+    TextureVolume::init_cuda(nullptr, volumeSize, false, nullptr, nullptr);
 #endif
 
-    printf(
-        "Press '+' and '-' to change density (0.01 increments)\n"
-        "      ']' and '[' to change brightness\n");
+    glm::mat4 model = glm::mat4(1.0f);
+    model           = glm::inverse(model);
+    model           = glm::transpose(model);
+    copy_inv_model_matrix(glm::value_ptr(model), sizeof(float4) * 3);
 
     // calculate new grid size
     gridSize = dim3(divideUp(P.width, blockSize.x), divideUp(P.height, blockSize.y));
@@ -960,5 +1077,8 @@ int main(int argc, char** argv)
     init_rng(gridSize, blockSize, P.width, P.height);
 
     glutCloseFunc(cleanup);
+
     glutMainLoop();
+
+    return 0;
 }

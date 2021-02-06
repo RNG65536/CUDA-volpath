@@ -5,11 +5,7 @@ include(D:/deps.cmake) # append thirdparty search paths to CMAKE_PREFIX_PATH
 
 option(USE_OPENVDB "Build OpenVDB loader" ON)
 
-set(srcs
-    "src/param.h"
-    "src/volumeRender_kernel.cu"
-    "src/volumeRender.cpp"
-)
+file(GLOB_RECURSE srcs "src/*.*")
 
 set(CMAKE_CXX_STANDARD 11)
 
