@@ -1091,7 +1091,7 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
 
         // direct lighting
 #if SPECTRAL_TRACKING
-        // reuse path and estimate for all channels
+        // reuse path and estimate for all channels (recommended)
         float3 a = Tr_spectral(boxMin,
                                boxMax,
                                pos,

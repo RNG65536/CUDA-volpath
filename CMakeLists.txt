@@ -5,11 +5,10 @@ include(D:/deps.cmake) # append thirdparty search paths to CMAKE_PREFIX_PATH
 
 option(USE_OPENVDB "Build OpenVDB loader" ON)
 
-file(GLOB_RECURSE srcs "src/*.*")
-
 set(CMAKE_CXX_STANDARD 11)
 
 enable_language(CUDA)
+find_package(CUDA REQUIRED)
 include_directories($ENV{NVCUDASAMPLES_ROOT}/common/inc)
 
 find_package(openmp QUIET)
@@ -27,12 +26,18 @@ if (USE_OPENVDB)
     add_definitions("-DUSE_OPENVDB=1")
 endif()
 
+add_subdirectory(thirdparty)
+
+file(GLOB_RECURSE srcs "src/*.*")
 add_executable(volpath ${srcs})
 
 target_include_directories(volpath PRIVATE ${GLM_INCLUDE_DIRS} ${GLUT_INCLUDE_DIR} ${GLEW_INCLUDE_DIR})
 target_link_libraries(volpath PRIVATE
     GLUT::GLUT
     GLEW::GLEW
+    optix7
+    ${CUDA_LIBRARIES}
+    ${CUDA_CUDA_LIBRARY}
 )
 
 if (USE_OPENVDB)

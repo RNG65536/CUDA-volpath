@@ -30,6 +30,9 @@ using namespace std::chrono_literals;
 #include <load_vdb.h>
 #endif
 
+bool g_denoise = false;
+#include "denoiser.h"
+
 std::vector<Param> params;
 
 // sigma_s, sigma_a
@@ -94,9 +97,6 @@ typedef unsigned char VolumeType;
 dim3 blockSize(8, 8);
 dim3 gridSize;
 
-GLuint pbo = 0;  // OpenGL pixel buffer object
-GLuint tex = 0;  // OpenGL texture object
-
 // float3 viewRotation = make_float3(20, -20, 0);
 // float3 viewTranslation = make_float3(0.0, 0.0, -4.0f);
 float3 viewRotation    = make_float3(-12, -90, 0);
@@ -131,8 +131,6 @@ extern "C" void set_texture_filter_mode(bool bLinearFilter);
 extern "C" void free_cuda_buffers();
 }  // namespace TextureVolume
 
-void initPixelBuffer();
-
 class SdkTimer
 {
     StopWatchInterface* timer = 0;
@@ -153,13 +151,12 @@ public:
 template <typename T>
 class PboResource
 {
-    struct cudaGraphicsResource* cuda_pbo_resource;  // CUDA Graphics Resource (to transfer PBO)
-    bool                         mapped = false;
+    struct cudaGraphicsResource* cuda_pbo_resource = nullptr;
+    bool                         mapped            = false;
 
 public:
     PboResource(unsigned int pbo)
     {
-        // register this buffer object with CUDA
         checkCudaErrors(cudaGraphicsGLRegisterBuffer(
             &cuda_pbo_resource, pbo, cudaGraphicsRegisterFlagsWriteDiscard));
     }
@@ -169,18 +166,15 @@ public:
         {
             unmap();
         }
-        // unregister this buffer object from CUDA C
         checkCudaErrors(cudaGraphicsUnregisterResource(cuda_pbo_resource));
     }
     T* map()
     {
         T* d_output;
-        // map PBO to get CUDA device pointer
         checkCudaErrors(cudaGraphicsMapResources(1, &cuda_pbo_resource, 0));
         size_t num_bytes;
         checkCudaErrors(
             cudaGraphicsResourceGetMappedPointer((void**)&d_output, &num_bytes, cuda_pbo_resource));
-        // printf("CUDA mapped PBO: May access %ld bytes\n", num_bytes);
         mapped = true;
         return d_output;
     }
@@ -191,14 +185,45 @@ public:
         mapped = false;
     }
 };
-//////////////////////////////////////////////////////////////////////////
+template <typename T>
+class Tex2DResource
+{
+    struct cudaGraphicsResource* cuda_tex_resource = nullptr;
+    bool                         mapped            = false;
 
-SdkTimer             timer;
-PboResource<float4>* resource = nullptr;
-Param                P;
+public:
+    Tex2DResource(unsigned int tex)
+    {
+        checkCudaErrors(cudaGraphicsGLRegisterImage(
+            &cuda_tex_resource, tex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard));
+    }
+    ~Tex2DResource()
+    {
+        if (mapped)
+        {
+            unmap();
+        }
+        checkCudaErrors(cudaGraphicsUnregisterResource(cuda_tex_resource));
+    }
+    cudaArray_t map()
+    {
+        cudaArray_t d_output;
+        checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, 0));
+        checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&d_output, cuda_tex_resource, 0, 0));
+        mapped = true;
+        return d_output;
+    }
+
+    void unmap()
+    {
+        checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, 0));
+        mapped = false;
+    }
+};
 
 class CudaFrameBuffer
 {
+protected:
     int     _width, _height;
     int     spp = 0;
     float4* sum_buffer;
@@ -209,14 +234,12 @@ public:
         _width  = w;
         _height = h;
         checkCudaErrors(cudaMalloc((void**)&sum_buffer, _width * _height * sizeof(float4)));
-        // clear image
-        checkCudaErrors(cudaMemset(sum_buffer, 0, _width * _height * sizeof(float4)));
+        this->reset();
     }
     ~CudaFrameBuffer() { checkCudaErrors(cudaFree(sum_buffer)); }
     void reset()
     {
         spp = 0;
-        // clear image
         checkCudaErrors(cudaMemset(sum_buffer, 0, _width * _height * sizeof(float4)));
     }
     float4* ptr() { return sum_buffer; }
@@ -231,7 +254,176 @@ public:
     int height() const { return _height; }
 };
 
-CudaFrameBuffer* fb = nullptr;
+class FrameBuffer : public CudaFrameBuffer
+{
+    void bind()
+    {
+        if (use_pbo)
+        {
+            mapped_buffer = resource->map();
+        }
+        else
+        {
+            mapped_array = resource_tex->map();
+        }
+    }
+    void unbind()
+    {
+        if (use_pbo)
+        {
+            resource->unmap();
+        }
+        else
+        {
+            resource_tex->unmap();
+        }
+    }
+
+public:
+    GLuint                                 pbo = 0;
+    GLuint                                 tex = 0;
+    std::unique_ptr<PboResource<float4>>   resource;
+    std::unique_ptr<Tex2DResource<float4>> resource_tex;
+    float4*                                mapped_buffer = nullptr;
+    cudaArray_t                            mapped_array  = nullptr;
+    std::unique_ptr<CudaDenoiser>          dn;
+
+    bool use_pbo = true;
+
+    FrameBuffer(int width, int height) : CudaFrameBuffer(width, height)
+    {
+        // create texture for display
+        glGenTextures(1, &tex);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        if (use_pbo)
+        {
+            // create pixel buffer object for display
+            glGenBuffers(1, &pbo);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            glBufferData(
+                GL_PIXEL_UNPACK_BUFFER, width * height * sizeof(GLfloat) * 4, 0, GL_STREAM_DRAW);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+            resource = std::make_unique<PboResource<float4>>(pbo);
+        }
+        else
+        {
+            resource_tex = std::make_unique<Tex2DResource<float4>>(tex);
+            checkCudaErrors(cudaMalloc((void**)&mapped_buffer, sizeof(float4) * width * height));
+        }
+
+        dn = std::make_unique<CudaDenoiser>(width, height);
+    }
+
+    ~FrameBuffer()
+    {
+        mapped_buffer = nullptr;
+        mapped_array  = nullptr;
+
+        if (use_pbo)
+        {
+            resource.reset();
+            glDeleteBuffers(1, &pbo);
+        }
+        else
+        {
+            resource_tex.reset();
+            checkCudaErrors(cudaFree(mapped_buffer));
+        }
+
+        glDeleteTextures(1, &tex);
+    }
+
+    void finalize_gamma(float gamma)
+    {
+        this->bind();
+
+        this->gammaCorrectedOutput(mapped_buffer, 2.2f);
+        if (!use_pbo)
+        {
+            checkCudaErrors(cudaMemcpy2DToArrayAsync(mapped_array,
+                                                     0,
+                                                     0,
+                                                     mapped_buffer,
+                                                     sizeof(float4) * _width,
+                                                     sizeof(float4) * _width,
+                                                     _height,
+                                                     cudaMemcpyDeviceToDevice));
+        }
+
+        this->unbind();
+    }
+
+    void finalize_denoised()
+    {
+        this->bind();
+
+        this->scaledOutput(mapped_buffer);
+        dn->denoise(this->samplesPerPixel(), mapped_buffer);
+        gamma_correct(mapped_buffer, mapped_buffer, _width * _height, 1.0f, 2.2f);
+
+        this->unbind();
+    }
+
+    void extract(void* data, bool hdr)
+    {
+        this->bind();
+
+        if (hdr) this->scaledOutput(mapped_buffer);
+        checkCudaErrors(cudaMemcpyAsync(
+            data, mapped_buffer, sizeof(float4) * _width * _height, cudaMemcpyDeviceToHost));
+
+        this->unbind();
+    }
+
+    void draw()
+    {
+        glBindTexture(GL_TEXTURE_2D, tex);
+
+        if (use_pbo)
+        {
+            // draw image from PBO
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+            // draw using texture
+            // copy from pbo to texture
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, _width, _height, GL_RGBA, GL_FLOAT, 0);
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        }
+
+        // display results
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDisable(GL_DEPTH_TEST);
+
+        // draw textured quad
+        glEnable(GL_TEXTURE_2D);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0);
+        glVertex2f(0, 0);
+        glTexCoord2f(1, 0);
+        glVertex2f(1, 0);
+        glTexCoord2f(1, 1);
+        glVertex2f(1, 1);
+        glTexCoord2f(0, 1);
+        glVertex2f(0, 1);
+        glEnd();
+
+        glDisable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+};
+
+std::unique_ptr<FrameBuffer> fb;
+
+SdkTimer timer;
+Param    P;
 
 int          fpsCount   = 0;  // FPS count for averaging
 int          fpsLimit   = 1;  // FPS limit for sampling
@@ -256,31 +448,31 @@ void computeFPS()
     }
 }
 
-void capture(bool use_denoiser = false)
+void capture(bool hdr = false)
 {
-    static int  i = 0;
+    static int  i   = 0;
+    std::string ext = hdr ? ".hdr" : ".ppm";
     std::string filename;
     do
     {
-        filename = "output" + std::to_string(i) + ".hdr";
+        filename = "output" + std::to_string(i) + ext;
         ++i;
     } while (exists(filename.c_str()));
 
     Image image(fb->width(), fb->height());
 
-    float4* d_output = resource->map();
-    fb->scaledOutput(d_output);
-    cudaMemcpy(image.buffer(),
-               d_output,
-               sizeof(float4) * image.width() * image.height(),
-               cudaMemcpyDeviceToHost);
-    resource->unmap();
+    fb->extract(image.buffer(), hdr);
 
     // image.flip_updown();
-    image.dump_hdr(filename.c_str());
-    filename += ".ppm";
-    image.tonemap_gamma(2.2f);
-    image.dump_ppm(filename.c_str());
+    if (hdr)
+    {
+        image.dump_hdr(filename.c_str());
+    }
+    else
+    {
+        // image.tonemap_gamma(2.2f);
+        image.dump_ppm(filename.c_str());
+    }
 }
 
 // render image using CUDA
@@ -296,28 +488,32 @@ void cuda_volpath()
         cam_update = false;
     }
 
-    // map PBO to get CUDA device pointer
-    float4* d_output = resource->map();
-
-    // call CUDA kernel, writing results to PBO
-    Timer timer;
-    render_kernel(gridSize, blockSize, fb->ptr(), fb->samplesPerPixel(), P);
-    checkCudaErrors(cudaDeviceSynchronize());
-    float elapsed = timer.elapsed();
-    printf("%f M samples / s, %d x %d, %f\n",
-           (float)P.width * (float)P.height / elapsed,
-           P.width,
-           P.height,
-           elapsed);
-
-    fb->incrementSPP();
-
+    for (int s = 0; s < 1; s++)
     {
-        fb->gammaCorrectedOutput(d_output, 2.2f);
+        // call CUDA kernel, writing results to PBO
+        Timer timer;
+        render_kernel(gridSize, blockSize, fb->ptr(), fb->samplesPerPixel(), P);
+        checkCudaErrors(cudaDeviceSynchronize());
+        float elapsed = timer.elapsed();
+        printf("%f M samples / s, %d x %d, %f\n",
+               (float)P.width * (float)P.height / elapsed,
+               P.width,
+               P.height,
+               elapsed);
+
+        fb->incrementSPP();
+    }
+
+    if (g_denoise)
+    {
+        fb->finalize_denoised();
+    }
+    else
+    {
+        fb->finalize_gamma(2.2f);
     }
 
     getLastCudaError("kernel failed");
-    resource->unmap();
 }
 
 // display results using OpenGL (called by GLUT)
@@ -327,35 +523,7 @@ void display()
 
     cuda_volpath();
 
-    // display results
-    glClear(GL_COLOR_BUFFER_BIT);
-    glDisable(GL_DEPTH_TEST);
-
-    // draw image from PBO
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-    // draw using texture
-    // copy from pbo to texture
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, P.width, P.height, GL_RGBA, GL_FLOAT, 0);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    // draw textured quad
-    glEnable(GL_TEXTURE_2D);
-    glBegin(GL_QUADS);
-    glTexCoord2f(0, 0);
-    glVertex2f(0, 0);
-    glTexCoord2f(1, 0);
-    glVertex2f(1, 0);
-    glTexCoord2f(1, 1);
-    glVertex2f(1, 1);
-    glTexCoord2f(0, 1);
-    glVertex2f(0, 1);
-    glEnd();
-
-    glDisable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    fb->draw();
 
     glutSwapBuffers();
     glutReportErrors();
@@ -446,6 +614,9 @@ void keyboard(unsigned char key, int x, int y)
             capture();
             break;
 
+        case 'n':
+            g_denoise = !g_denoise;
+
         default:
             break;
     }
@@ -528,7 +699,7 @@ void reshape(int w, int h)
 {
     P.width  = w;
     P.height = h;
-    initPixelBuffer();
+    fb       = std::make_unique<FrameBuffer>(P.width, P.height);
 
     // calculate new grid size
     gridSize = dim3(divideUp(P.width, blockSize.x), divideUp(P.height, blockSize.y));
@@ -543,9 +714,6 @@ void reshape(int w, int h)
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glOrtho(0.0, 1.0, 0.0, 1.0, 0.0, 1.0);
-
-    delete fb;
-    fb = new CudaFrameBuffer(P.width, P.height);
 }
 
 void cleanup()
@@ -553,14 +721,7 @@ void cleanup()
     TextureVolume::free_cuda_buffers();
     free_rng();
 
-    if (pbo)
-    {
-        delete resource;
-        glDeleteBuffers(1, &pbo);
-        glDeleteTextures(1, &tex);
-
-        delete fb;
-    }
+    fb.reset();
 
     // cudaDeviceReset causes the driver to clean up all state. While
     // not mandatory in normal operation, it is good practice.  It is also
@@ -568,38 +729,6 @@ void cleanup()
     // profiled. Calling cudaDeviceReset causes all profile data to be
     // flushed before the application exits
     cudaDeviceReset();
-}
-
-void initPixelBuffer()
-{
-    if (pbo)
-    {
-        delete resource;
-
-        // delete old buffer
-        glDeleteBuffers(1, &pbo);
-        glDeleteTextures(1, &tex);
-
-        delete fb;
-    }
-
-    // create pixel buffer object for display
-    glGenBuffers(1, &pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-    glBufferData(
-        GL_PIXEL_UNPACK_BUFFER, P.width * P.height * sizeof(GLfloat) * 4, 0, GL_STREAM_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    resource = new PboResource<float4>(pbo);
-    fb       = new CudaFrameBuffer(P.width, P.height);
-
-    // create texture for display
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, P.width, P.height, 0, GL_RGBA, GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glBindTexture(GL_TEXTURE_2D, 0);
 }
 
 // Load raw data from disk
@@ -1073,12 +1202,16 @@ int main(int argc, char** argv)
     glutReshapeFunc(reshape);
     glutIdleFunc(idle);
 
-    initPixelBuffer();
+    CudaDenoiser::create_context();
+
+    fb = std::make_unique<FrameBuffer>(P.width, P.height);
     init_rng(gridSize, blockSize, P.width, P.height);
 
     glutCloseFunc(cleanup);
 
     glutMainLoop();
+
+    CudaDenoiser::free_context();
 
     return 0;
 }
