@@ -31,7 +31,7 @@ add_subdirectory(thirdparty)
 file(GLOB_RECURSE srcs "src/*.*")
 add_executable(volpath ${srcs})
 
-target_include_directories(volpath PRIVATE ${GLM_INCLUDE_DIRS} ${GLUT_INCLUDE_DIR} ${GLEW_INCLUDE_DIR})
+target_include_directories(volpath PRIVATE ${GLM_INCLUDE_DIRS} ${GLUT_INCLUDE_DIR} ${GLEW_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(volpath PRIVATE
     GLUT::GLUT
     GLEW::GLEW

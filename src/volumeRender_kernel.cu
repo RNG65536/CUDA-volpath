@@ -6,22 +6,29 @@
 #include <iostream>
 
 #include "param.h"
+#include "vecmath.h"
 
 //
 // Configurations
 //
+
+// enable to add explicit directional sun light
+#define SUN_LIGHT 1
+
+// enable to use passive envmap sampling
+#define PASSIVE_ENVMAP 1
+
+// enable one of these for proper spectral rendering
+// disable both for fast non spectral rendering (only works for achromatic
+// media)
+#define MULTI_CHANNEL 0
+#define SPECTRAL_TRACKING (!(MULTI_CHANNEL))
 
 // allow transforming the bounding box, but slows down the renderer
 #define USE_MODEL_TRANSFORM 0
 
 // slower, but extended with float texture support
 #define DYNAMIC_TEXTURE 0
-
-// enable one of these for proper spectral rendering
-// disable both for fast non spectral rendering (only works for achromatic
-// media)
-#define MULTI_CHANNEL 0
-#define SPECTRAL_TRACKING 1
 
 #define FAST_RNG 1
 
@@ -36,7 +43,6 @@ float2* compute_volume_value_bound(const float*      volume,
 
 using std::cout;
 using std::endl;
-#define M_PI 3.14159265358979323846
 
 typedef unsigned int  uint;
 typedef unsigned char uchar;
@@ -44,6 +50,17 @@ typedef unsigned char uchar;
 typedef unsigned char VolumeType;
 
 #define GetChannel(v, i) ((&(v).x)[i])
+
+__device__ float MIS_balance_heuristic(float a, float b) { return a / (a + b); }
+
+__device__ float MIS_power_heuristic(float a, float b) { return (a * a) / (a * a + b * b); }
+
+__device__ float MIS_balance_heuristic(float a, float b, float c) { return a / (a + b + c); }
+
+__device__ float MIS_power_heuristic(float a, float b, float c)
+{
+    return (a * a) / (a * a + b * b + c * c);
+}
 
 __device__ float max_of(float a, float b, float c) { return fmaxf(fmaxf(a, b), c); }
 
@@ -904,10 +921,450 @@ __device__ float3 Trr(const float3& boxMin,
     return w;
 }
 
-__device__ __forceinline__ float3 background(const float3& dir)
+namespace Envmap
+{
+template <typename T>
+struct stl_vector
+{
+    T*     _data = nullptr;
+    size_t _size = 0;
+
+    stl_vector(int size) : _size(size) { _data = new T[size]; }
+    ~stl_vector() { delete[] _data; }
+    T*       data() { return _data; }
+    const T* data() const { return _data; }
+    T&       operator[](size_t i) { return _data[i]; }
+    const T& operator[](size_t i) const { return _data[i]; }
+    T*       begin() { return _data; }
+    const T* cbegin() const { return _data; }
+    T*       end() { return _data + _size; }
+    const T* cend() const { return _data + _size; }
+};
+
+#define MULT_PDF 0
+#define PRE_WARP 1
+
+__constant__ int                            HDRwidth;
+__constant__ int                            HDRheight;
+__constant__ float                          HDRpdfnorm;
+__constant__ float                          HDRpdfnormAlt;
+texture<float4, 2, cudaReadModeElementType> HDRtexture;
+cudaArray_t                                 HDRtexture_  = nullptr;
+cudaArray_t                                 HDRtexture_t = nullptr;
+texture<float, 1, cudaReadModeElementType>  EnvmapPdfY;
+cudaArray_t                                 EnvmapPdfY_  = nullptr;
+cudaArray_t                                 EnvmapPdfY_t = nullptr;
+texture<float, 1, cudaReadModeElementType>  EnvmapCdfY;
+cudaArray_t                                 EnvmapCdfY_  = nullptr;
+cudaArray_t                                 EnvmapCdfY_t = nullptr;
+texture<float, 2, cudaReadModeElementType>  EnvmapPdfX;
+cudaArray_t                                 EnvmapPdfX_  = nullptr;
+cudaArray_t                                 EnvmapPdfX_t = nullptr;
+texture<float, 2, cudaReadModeElementType>  EnvmapCdfX;
+cudaArray_t                                 EnvmapCdfX_  = nullptr;
+cudaArray_t                                 EnvmapCdfX_t = nullptr;
+
+int  envmap_width  = 0;
+int  envmap_height = 0;
+bool initialized   = 0;
+
+__device__ inline float dir_to_theta(const vec3& dir)
+{
+    float theta = atanf(dir[2] / dir[0]) + M_PI_2;
+    if (dir[0] < 0) theta += M_PI;
+    return theta;
+}
+
+__device__ inline void dir_to_uv(const vec3& dir, float& u, float& v)
+{
+    float phi   = acosf(dir.y);
+    float theta = dir_to_theta(dir);
+    u           = theta * M_1_TWOPI;
+    v           = phi * M_1_PI;
+}
+
+__device__ inline vec3 uv_to_dir(float u, float v)
+{
+    float theta = u * TWO_PI;
+    float phi   = v * M_PI;
+    return vec3(sin(phi) * sin(theta), cos(phi), sin(phi) * -cos(theta));
+}
+
+__device__ int sample_y(float r)
+{
+    int begin = 0;
+    int end   = HDRheight - 1;
+    while (end > begin)
+    {
+        int   mid = begin + (end - begin) / 2;
+        float c   = tex1D<float>(EnvmapCdfY, mid + 0.5f);
+        if (c >= r)
+        {
+            end = mid;
+        }
+        else
+        {
+            begin = mid + 1;
+        }
+    }
+
+    return begin;
+}
+
+__device__ int sample_x(int y, float r)
+{
+    int begin = 0;
+    int end   = HDRwidth - 1;
+    while (end > begin)
+    {
+        int   mid = begin + (end - begin) / 2;
+        float c   = tex2D<float>(EnvmapCdfX, mid + 0.5f, y + 0.5f);
+        if (c >= r)
+        {
+            end = mid;
+        }
+        else
+        {
+            begin = mid + 1;
+        }
+    }
+
+    return begin;
+}
+
+__host__ __device__ float luminance(const float4& c)
+{
+    return c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722;
+}
+
+__host__ __device__ float luminance(const vec3& c)
+{
+    return c.x * 0.2126 + c.y * 0.7152 + c.z * 0.0722;
+}
+
+__device__ vec3 eval_envmap(const vec3& raydir)
+{
+#if 0
+    float longlatX = ((raydir.x > 0 ? atanf(raydir.z / raydir.x) : atanf(raydir.z / raydir.x) + M_PI) + M_PI * 0.5);
+    float longlatY = acosf(raydir.y);  // add RotateMap at some point, see Fragmentarium
+
+    // map theta and phi to u and v texturecoordinates in [0,1] x [0,1] range
+    float offsetY = 0.5f;
+    float u       = longlatX / TWO_PI;  // +offsetY;
+    float v       = longlatY / M_PI;
+#else
+    float u, v;
+    dir_to_uv(raydir, u, v);
+#endif
+
+    float4 HDRcol = tex2D<float4>(HDRtexture, u, v);  // fetch from texture
+    return vec3(HDRcol);
+}
+
+// importance sample envmap
+// input as randfs
+// output as x-y coordinates
+// returns pdf
+__device__ float sample_envmap(float& u, float& v, vec3& c)
+{
+    int iy = sample_y(v);
+    int ix = sample_x(iy, u);
+
+    // TODO : hash uv as randfs for in-pixel offset
+    u = ((float)ix + 0.5f) / (float)HDRwidth;
+    v = ((float)iy + 0.5f) / (float)HDRheight;
+
+    c = vec3(tex2D<float4>(HDRtexture, u, v));
+
+#if MULT_PDF
+    // any warp available
+    float pdf = tex1D(EnvmapPdfY, iy + 0.5f) * tex2D(EnvmapPdfX, ix + 0.5f, iy + 0.5f);
+    pdf *= HDRpdfnorm;
+    float phi = v * M_PI;
+    pdf /= sin(phi);
+#else
+    // consistent with sine warp
+    float pdf = luminance(c) * HDRpdfnormAlt;
+    float phi = v * M_PI;
+#if !(PRE_WARP)
+    pdf /= sin(phi);  // cancelled with the same factor in luminance of the original envmap
+#endif
+#endif
+
+    return pdf;
+}
+
+__device__ float pdf_envmap(const vec3& dir, const vec3& dir_color)
+{
+    float u, v;
+    dir_to_uv(dir, u, v);
+
+#if MULT_PDF
+    int ix = u * HDRwidth;
+    int iy = v * HDRheight;
+    // any warp available
+    float pdf = tex1D(EnvmapPdfY, iy + 0.5f) * tex2D(EnvmapPdfX, ix + 0.5f, iy + 0.5f);
+    pdf *= HDRpdfnorm;
+    float phi = v * M_PI;
+    pdf /= sin(phi);
+#else
+    // consistent with sine warp
+
+    // float pdf = luminance(tex2D(HDRtexture, u, v)) * HDRpdfnormAlt;
+    float pdf = luminance(dir_color) * HDRpdfnormAlt;
+
+    float phi = v * M_PI;
+#if !(PRE_WARP)
+    pdf /= sin(phi);  // cancelled with the same factor in luminance of the original envmap
+#endif
+#endif
+
+    return pdf;
+}
+
+static float build_cdf_1d(const float* f, float* pdf, float* cdf, int size)
+{
+    if (size < 1) return 0;
+
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) sum += f[i];
+    float norm = 1.0f / sum;
+
+    float I = 0.0f;
+    for (int i = 0; i < size; i++)
+    {
+        float p = f[i] * norm;
+        I += p;
+        pdf[i] = p;
+        cdf[i] = I;
+    }
+    cdf[size - 1] = 1.0f;
+
+    return sum;
+}
+
+static float build_cdf_2d(
+    const float* f, float* pdfY, float* cdfY, float* pdfX, float* cdfX, int width, int height)
+{
+    if (width < 1 || height < 1) return 0;
+
+    stl_vector<float> row_sum(height);
+
+    for (int y = 0; y < height; y++)
+    {
+        row_sum[y] = build_cdf_1d(f + y * width, pdfX + y * width, cdfX + y * width, width);
+    }
+    float sum = build_cdf_1d(row_sum.data(), pdfY, cdfY, height);
+    return sum;
+}
+
+extern "C" void init_envmap(const float4* HDRmap, int width, int height)
+{
+    bool                  resized     = false;
+    cudaChannelFormatDesc desc_float4 = cudaCreateChannelDesc<float4>();
+    cudaChannelFormatDesc desc_float  = cudaCreateChannelDesc<float>();
+
+    if (width != envmap_width || height != envmap_height)
+    {
+        // delay free array until texture rebound
+        HDRtexture_t = HDRtexture_;
+        EnvmapPdfY_t = EnvmapPdfY_;
+        EnvmapCdfY_t = EnvmapCdfY_;
+        EnvmapPdfX_t = EnvmapPdfX_;
+        EnvmapCdfX_t = EnvmapCdfX_;
+
+        envmap_width  = width;
+        envmap_height = height;
+
+        checkCudaErrors(cudaMemcpyToSymbol(HDRwidth, &width, sizeof(int)));
+        checkCudaErrors(cudaMemcpyToSymbol(HDRheight, &height, sizeof(int)));
+
+        // float pdfnorm = (float)width * (float)height * M_1_TWO_PI_PI;
+        float pdfnorm = (float)width * (float)height / (M_PI * TWO_PI);
+        checkCudaErrors(cudaMemcpyToSymbol(HDRpdfnorm, &pdfnorm, sizeof(float)));
+
+        // envmap color tex
+        checkCudaErrors(cudaMallocArray(&HDRtexture_, &desc_float4, width, height));
+        HDRtexture.filterMode = cudaFilterModePoint;
+        HDRtexture.normalized = 1;
+        checkCudaErrors(cudaBindTextureToArray(&HDRtexture, HDRtexture_, &desc_float4));
+
+        // pdfY
+        checkCudaErrors(cudaMallocArray(&EnvmapPdfY_, &desc_float, height));
+        EnvmapPdfY.filterMode = cudaFilterModePoint;
+        EnvmapPdfY.normalized = 0;
+        checkCudaErrors(cudaBindTextureToArray(&EnvmapPdfY, EnvmapPdfY_, &desc_float));
+
+        // cdfY
+        checkCudaErrors(cudaMallocArray(&EnvmapCdfY_, &desc_float, height));
+        EnvmapCdfY.filterMode = cudaFilterModePoint;
+        EnvmapCdfY.normalized = 0;
+        checkCudaErrors(cudaBindTextureToArray(&EnvmapCdfY, EnvmapCdfY_, &desc_float));
+
+        // pdfX
+        checkCudaErrors(cudaMallocArray(&EnvmapPdfX_, &desc_float, width, height));
+        EnvmapPdfX.filterMode = cudaFilterModePoint;
+        EnvmapPdfX.normalized = 0;
+        checkCudaErrors(cudaBindTextureToArray(&EnvmapPdfX, EnvmapPdfX_, &desc_float));
+
+        // cdfX
+        checkCudaErrors(cudaMallocArray(&EnvmapCdfX_, &desc_float, width, height));
+        EnvmapCdfX.filterMode = cudaFilterModePoint;
+        EnvmapCdfX.normalized = 0;
+        checkCudaErrors(cudaBindTextureToArray(&EnvmapCdfX, EnvmapCdfX_, &desc_float));
+
+        resized = true;
+    }
+
+    // envmap color tex
+    {
+        checkCudaErrors(cudaMemcpy2DToArray(HDRtexture_,
+                                            0,
+                                            0,
+                                            HDRmap,
+                                            sizeof(float4) * width,
+                                            sizeof(float4) * width,
+                                            height,
+                                            cudaMemcpyHostToDevice));
+    }
+
+    // cdf texture
+    size_t            total = size_t(width) * size_t(height);
+    stl_vector<float> lum(total);
+    for (size_t i = 0; i < total; i++)
+    {
+        lum[i] = luminance(HDRmap[i]);
+    }
+
+#if PRE_WARP
+    for (int y = 0; y < height; y++)
+    {
+        for (int x = 0; x < width; x++)
+        {
+            float phi = M_PI * (y + 0.5f) / height;
+            lum[x + y * width] *= sin(phi);
+        }
+    }
+#endif
+
+    float lumsum = 0.0f;
+    for (const auto& l : lum) lumsum += l;
+    float pdfnormalt = (float)width * (float)height * M_1_TWO_PI_PI / lumsum;
+    checkCudaErrors(cudaMemcpyToSymbol(HDRpdfnormAlt, &pdfnormalt, sizeof(float)));
+
+    stl_vector<float> pdfY(height);
+    stl_vector<float> cdfY(height);
+    stl_vector<float> pdfX(total);
+    stl_vector<float> cdfX(total);
+    build_cdf_2d(lum.data(), pdfY.data(), cdfY.data(), pdfX.data(), cdfX.data(), width, height);
+
+    {
+        // pdfY
+        checkCudaErrors(cudaMemcpyToArray(
+            EnvmapPdfY_, 0, 0, pdfY.data(), sizeof(float) * height, cudaMemcpyHostToDevice));
+    }
+
+    {
+        // cdfY
+        checkCudaErrors(cudaMemcpyToArray(
+            EnvmapCdfY_, 0, 0, cdfY.data(), sizeof(float) * height, cudaMemcpyHostToDevice));
+    }
+
+    {
+        // pdfX
+        checkCudaErrors(cudaMemcpy2DToArray(EnvmapPdfX_,
+                                            0,
+                                            0,
+                                            pdfX.data(),
+                                            sizeof(float) * width,
+                                            sizeof(float) * width,
+                                            height,
+                                            cudaMemcpyHostToDevice));
+    }
+
+    {
+        // cdfX
+        checkCudaErrors(cudaMemcpy2DToArray(EnvmapCdfX_,
+                                            0,
+                                            0,
+                                            cdfX.data(),
+                                            sizeof(float) * width,
+                                            sizeof(float) * width,
+                                            height,
+                                            cudaMemcpyHostToDevice));
+    }
+
+    if (resized)
+    {
+        checkCudaErrors(cudaFreeArray(HDRtexture_t));
+        checkCudaErrors(cudaFreeArray(EnvmapPdfY_t));
+        checkCudaErrors(cudaFreeArray(EnvmapCdfY_t));
+        checkCudaErrors(cudaFreeArray(EnvmapPdfX_t));
+        checkCudaErrors(cudaFreeArray(EnvmapCdfX_t));
+        HDRtexture_t = nullptr;
+        EnvmapPdfY_t = nullptr;
+        EnvmapCdfY_t = nullptr;
+        EnvmapPdfX_t = nullptr;
+        EnvmapCdfX_t = nullptr;
+    }
+
+    // checkCudaErrors(cudaDeviceSynchronize());
+    initialized = true;
+    // std::cout << "gpu envmap initialized" << std::endl;
+}
+
+extern "C" void free_envmap()
+{
+    if (!initialized) return;
+
+    // checkCudaErrors(cudaUnbindTexture(&HDRtexture));
+    // checkCudaErrors(cudaUnbindTexture(&EnvmapPdfY));
+    // checkCudaErrors(cudaUnbindTexture(&EnvmapCdfY));
+    // checkCudaErrors(cudaUnbindTexture(&EnvmapPdfX));
+    // checkCudaErrors(cudaUnbindTexture(&EnvmapCdfX));
+
+    checkCudaErrors(cudaFreeArray(HDRtexture_));
+    checkCudaErrors(cudaFreeArray(EnvmapPdfY_));
+    checkCudaErrors(cudaFreeArray(EnvmapCdfY_));
+    checkCudaErrors(cudaFreeArray(EnvmapPdfX_));
+    checkCudaErrors(cudaFreeArray(EnvmapCdfX_));
+
+    // checkCudaErrors(cudaDeviceSynchronize());
+    initialized = false;
+    std::cout << "gpu envmap freed" << std::endl;
+}
+
+}  // namespace Envmap
+
+__constant__ float3 sun_light_dir;
+__constant__ float3 sun_light_power;
+__constant__ float3 sun_light_power_original;
+
+__device__ __forceinline__ float3 background(const float3& dir, int depth)
 {
     // return make_float4(0.15f, 0.20f, 0.25f) * 0.5f * (dir.y + 0.5);
-    return (dir.y > -0.1f) ? make_float3(0.03, 0.07, 0.23) : make_float3(0.03, 0.03, 0.03);
+    // return (dir.y > -0.1f) ? make_float3(0.03, 0.07, 0.23) : make_float3(0.03, 0.03, 0.03);
+#if SUN_LIGHT
+    if (depth == 0 && (dot(dir, sun_light_dir) > 94.0f / sqrtf(94.0f * 94.0f + 0.45f * 0.45f)))
+        return sun_light_power_original;
+#endif
+    return Envmap::eval_envmap(dir);
+}
+
+extern "C" void set_sun(float* sun_dir, float* sun_power)
+{
+    checkCudaErrors(cudaMemcpyToSymbolAsync(sun_light_power_original, sun_power, sizeof(float3)));
+
+    // convert from disk light to directional light
+    // sun's solid angle is its projected area on unit sphere
+    float3 p = make_float3(sun_power[0], sun_power[1], sun_power[2]);
+    float  r = 0.45 / 94.0f;
+    p *= M_PI * (r * r);
+
+    // const float3 light_dir   = make_float3(0.5826, 0.7660, 0.2717);
+    // const float3 light_power = make_float3(2.6, 2.5, 2.3);
+    checkCudaErrors(cudaMemcpyToSymbolAsync(sun_light_dir, sun_dir, sizeof(float3)));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(sun_light_power, &p.x, sizeof(float3)));
 }
 
 __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
@@ -915,9 +1372,6 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
     const float  density    = P.density;
     const float  brightness = P.brightness;
     const float3 albedo     = P.albedo;
-
-    const float3 light_dir   = make_float3(0.5826, 0.7660, 0.2717);
-    const float3 light_power = make_float3(2.6, 2.5, 2.3);
 
 #if DYNAMIC_TEXTURE
     const float3& boxMin = TextureVolume::density_tex.min;
@@ -977,7 +1431,11 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
 
         if (!hit)
         {
-            radiance += background(cr.d) * throughput;
+#if PASSIVE_ENVMAP
+            radiance += background(cr.d, i) * throughput;
+#else
+            if (0 == i) radiance += background(cr.d) * throughput;
+#endif
             break;
         }
 
@@ -1079,7 +1537,11 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
         // probability is exp(-optical_thickness)
         if (through)
         {
-            radiance += background(cr.d) * throughput;
+#if PASSIVE_ENVMAP
+            radiance += background(cr.d, i) * throughput;
+#else
+            if (0 == i) radiance += background(cr.d) * throughput;
+#endif
             break;
         }
 
@@ -1089,56 +1551,118 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
 
         Frame frame(cr.d);
 
+        //
         // direct lighting
+        //
+        {
+            // to match passive result
+            float s = fmaxf(0.0f, fminf(1.0f, (i - 4) * 0.066666666666666666667f));  // (i + 1) - 5
+            float g = (1 - s) * P.g;
 #if SPECTRAL_TRACKING
-        // reuse path and estimate for all channels (recommended)
-        float3 a = Tr_spectral(boxMin,
-                               boxMax,
-                               pos,
-                               light_dir * 1e10f,
-                               inv_sigma,
-                               density_prime,
-                               sigma_t_spectral,
-                               rng);
-        radiance += light_power * (throughput * phase.evaluate(frame, light_dir) * a);
-
-        // choose one channel for nee, others terminated using russian roulette, noisier
-        // int nee_channel = fminf((1.0f - rng.next()) * 3.0f, 2.9999998f);
-        // float a = Tr(boxMin,
-        //             boxMax,
-        //             pos,
-        //             light_dir * 1e10f,
-        //             GetChannel(inv_sigma_spectral, nee_channel),
-        //             GetChannel(sigma_t_spectral * density_prime, nee_channel),
-        //             rng);
-        // GetChannel(radiance, nee_channel) +=
-        //    GetChannel(light_power, nee_channel) *
-        //    GetChannel(throughput, nee_channel) *
-        //    phase.evaluate(frame, light_dir) * a * 3.0f;
-
-        // using individual sampling sigma_t for each channel
-        // float a0 = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma_spectral.x,
-        // sigma_t_spectral.x * density_prime, rng); float a1 = Tr(boxMin, boxMax, pos, light_dir *
-        // 1e10f, inv_sigma_spectral.y, sigma_t_spectral.y * density_prime, rng); float a2 =
-        // Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma_spectral.z, sigma_t_spectral.z *
-        // density_prime, rng); radiance += light_power * (throughput * phase.evaluate(frame,
-        // light_dir) * make_float3(a0, a1, a2));
-
-        // slower using the largest sampling sigma_t for all channels
-        // float a0 = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma, sigma_t_spectral.x *
-        // density_prime, rng); float a1 = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma,
-        // sigma_t_spectral.y * density_prime, rng); float a2 = Tr(boxMin, boxMax, pos, light_dir *
-        // 1e10f, inv_sigma, sigma_t_spectral.z * density_prime, rng); radiance += light_power *
-        // (throughput * phase.evaluate(frame, light_dir) * make_float3(a0, a1, a2));
-
-        // slow using ratio tracking, and little improvement for high order scattering
-        // float3 a = Trr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma, density_prime,
-        // sigma_t_spectral, rng); radiance += light_power * (throughput * phase.evaluate(frame,
-        // light_dir) * a);
+            float  density_prime      = (1 - s) * density + s * density * (1 - P.g);
+            float  sigma_t_prime      = max_sigma_t * density_prime;  // max volume density is 1
+            float3 inv_sigma_spectral = make_float3(1.0f) / (sigma_t_spectral * density_prime);
 #else
-        float a = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
-        radiance += light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+            float sigma_t_prime = (1 - s) * sigma_t + s * sigma_t * (1 - P.g);
 #endif
+            float inv_sigma = 1.0f / sigma_t_prime;  // max volume density is 1
+
+#if SUN_LIGHT
+#if SPECTRAL_TRACKING
+            // reuse path and estimate for all channels (recommended)
+            float3 a = Tr_spectral(boxMin,
+                                   boxMax,
+                                   pos,
+                                   sun_light_dir * 1e10f,
+                                   inv_sigma,
+                                   density_prime,
+                                   sigma_t_spectral,
+                                   rng);
+            radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#else
+            float a = Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+            radiance += light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#endif
+#endif
+
+#if !(PASSIVE_ENVMAP)
+            //
+            // one sample MIS
+            //
+            constexpr float P_phase  = 0.5f;
+            constexpr float P_envmap = 1.0f - P_phase;
+            // sample by phase function
+            if (rng.next() < P_phase)
+            {
+                float u        = rng.next();
+                float v        = rng.next();
+                vec3  brdf_dir = phase.sample(frame, u, v);
+                // brdf_dir      = normalize(brdf_dir);
+
+                vec3  envc            = Envmap::eval_envmap(brdf_dir);
+                float pdf_brdf        = phase.evaluate(frame, brdf_dir);  // perfect cancellation
+                float pdf_env_virtual = Envmap::pdf_envmap(brdf_dir, envc);
+                // float weight          = MIS_power_heuristic(pdf_brdf, pdf_env_virtual);
+                float weight =
+                    MIS_balance_heuristic(pdf_brdf * P_phase, pdf_env_virtual * P_envmap) / P_phase;
+
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       brdf_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance += envc * (throughput /** phase.evaluate(frame, brdf_dir) / pdf_brdf*/ *
+                                    weight * a);
+#else
+                float a = Tr(boxMin, boxMax, pos, brdf_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance += envc * (throughput /** phase.evaluate(frame, brdf_dir) / pdf_brdf*/ *
+                                    weight * a);
+#endif
+            }
+            // sample by envmap pdf
+            else
+            {
+                float u = rng.next();
+                float v = rng.next();
+                vec3  envc;
+                float pdf_env = Envmap::sample_envmap(u, v, envc);
+                if (pdf_env <= 0.0f) continue;
+
+                vec3 envmap_dir = Envmap::uv_to_dir(u, v);
+                // envmap_dir      = normalize(envmap_dir);
+
+                float pdf_brdf_virtual = phase.evaluate(frame, envmap_dir);
+                // float weight           = MIS_power_heuristic(pdf_env, pdf_brdf_virtual);
+                float weight =
+                    MIS_balance_heuristic(pdf_env * P_envmap, pdf_brdf_virtual * P_phase) /
+                    P_envmap;
+
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       envmap_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance +=
+                    envc * (throughput * phase.evaluate(frame, envmap_dir) / pdf_env * weight * a);
+#else
+                float a =
+                    Tr(boxMin, boxMax, pos, envmap_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance +=
+                    envc * (throughput * phase.evaluate(frame, envmap_dir) / pdf_env * weight * a);
+#endif
+            }
+#endif
+        }
 
         // scattered direction
         float3 new_dir = normalize(phase.sample(frame, rng.next(), rng.next()));
@@ -1260,9 +1784,6 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
     const float  brightness = P.brightness;
     const float3 albedo     = P.albedo;
 
-    const float3 light_dir   = make_float3(0.5826, 0.7660, 0.2717);
-    const float3 light_power = make_float3(2.6, 2.5, 2.3);
-
 #if DYNAMIC_TEXTURE
     const float3& boxMin = TextureVolume::density_tex.min;
     const float3& boxMax = TextureVolume::density_tex.max;
@@ -1324,7 +1845,11 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
 
         if (!hit)
         {
-            radiance += background(cr.d) * throughput;
+#if PASSIVE_ENVMAP
+            radiance += background(cr.d, num_scatters) * throughput;
+#else
+            if (0 == num_scatters) radiance += background(cr.d) * throughput;
+#endif
             break;
         }
 
@@ -1414,22 +1939,120 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
 
         Frame frame(cr.d);
 
+        //
         // direct lighting
+        //
+        {
+            // to match passive result (note that num_scatters is already incremented)
+            float s = fmaxf(0.0f, fminf(1.0f, (num_scatters - 5) * 0.066666666666666666667f));
+            float g = (1 - s) * P.g;
+            float reduction_factor = (1 - s) + s * (1 - P.g);
 #if SPECTRAL_TRACKING
-        // reuse path and estimate for all channels (recommended)
-        float3 a = Tr_spectral(boxMin,
-                               boxMax,
-                               pos,
-                               light_dir * 1e10f,
-                               inv_sigma,
-                               density_prime,
-                               sigma_t_spectral,
-                               rng);
-        radiance += light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+            float density_prime = reduction_factor * density;
+            float sigma_t_prime =
+                max_sigma_t * density_prime * d_max;  // max volume density is d_max
+            float3 inv_sigma_spectral = make_float3(1.0f) / (sigma_t_spectral * density_prime);
 #else
-        float a = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
-        radiance += light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+            float sigma_t_prime = reduction_factor * sigma_t;
 #endif
+            float inv_sigma = 1.0f / sigma_t_prime;  // max volume density is d_max
+
+#if SUN_LIGHT
+#if SPECTRAL_TRACKING
+            // reuse path and estimate for all channels (recommended)
+            float3 a = Tr_spectral(boxMin,
+                                   boxMax,
+                                   pos,
+                                   sun_light_dir * 1e10f,
+                                   inv_sigma,
+                                   density_prime,
+                                   sigma_t_spectral,
+                                   rng);
+            radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#else
+            float a = Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+            radiance += light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#endif
+#endif
+
+#if !(PASSIVE_ENVMAP)
+            //
+            // one sample MIS
+            //
+            constexpr float P_phase  = 0.5f;
+            constexpr float P_envmap = 1.0f - P_phase;
+            // sample by phase function
+            if (rng.next() < P_phase)
+            {
+                float u        = rng.next();
+                float v        = rng.next();
+                vec3  brdf_dir = phase.sample(frame, u, v);
+                // brdf_dir      = normalize(brdf_dir);
+
+                vec3  envc            = Envmap::eval_envmap(brdf_dir);
+                float pdf_brdf        = phase.evaluate(frame, brdf_dir);  // perfect cancellation
+                float pdf_env_virtual = Envmap::pdf_envmap(brdf_dir, envc);
+                // float weight          = MIS_power_heuristic(pdf_brdf, pdf_env_virtual);
+                float weight =
+                    MIS_balance_heuristic(pdf_brdf * P_phase, pdf_env_virtual * P_envmap) / P_phase;
+
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       brdf_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance += envc * (throughput /** phase.evaluate(frame, brdf_dir) / pdf_brdf*/ *
+                                    weight * a);
+#else
+                float a = Tr(boxMin, boxMax, pos, brdf_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance += envc * (throughput /** phase.evaluate(frame, brdf_dir) / pdf_brdf*/ *
+                                    weight * a);
+#endif
+            }
+            // sample by envmap pdf
+            else
+            {
+                float u = rng.next();
+                float v = rng.next();
+                vec3  envc;
+                float pdf_env = Envmap::sample_envmap(u, v, envc);
+                if (pdf_env <= 0.0f) continue;
+
+                vec3 envmap_dir = Envmap::uv_to_dir(u, v);
+                // envmap_dir      = normalize(envmap_dir);
+
+                float pdf_brdf_virtual = phase.evaluate(frame, envmap_dir);
+                // float weight           = MIS_power_heuristic(pdf_env, pdf_brdf_virtual);
+                float weight =
+                    MIS_balance_heuristic(pdf_env * P_envmap, pdf_brdf_virtual * P_phase) /
+                    P_envmap;
+
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       envmap_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance +=
+                    envc * (throughput * phase.evaluate(frame, envmap_dir) / pdf_env * weight * a);
+#else
+                float a =
+                    Tr(boxMin, boxMax, pos, envmap_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance +=
+                    envc * (throughput * phase.evaluate(frame, envmap_dir) / pdf_env * weight * a);
+#endif
+            }
+#endif
+        }
 
         // scattered direction
         float3 new_dir = normalize(phase.sample(frame, rng.next(), rng.next()));
@@ -1460,9 +2083,6 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
     const float  density    = P.density;
     const float  brightness = P.brightness;
     const float3 albedo     = P.albedo;
-
-    const float3 light_dir   = make_float3(0.5826, 0.7660, 0.2717);
-    const float3 light_power = make_float3(2.6, 2.5, 2.3);
 
 #if DYNAMIC_TEXTURE
     const float3& boxMin = TextureVolume::density_tex.min;
@@ -1535,7 +2155,11 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
 
         if (!hit)
         {
-            radiance += background(cr.d) * throughput;
+#if PASSIVE_ENVMAP
+            radiance += background(cr.d, num_scatters) * throughput;
+#else
+            if (0 == num_scatters) radiance += background(cr.d) * throughput;
+#endif
             break;
         }
 
@@ -1668,22 +2292,120 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
 
         Frame frame(cr.d);
 
+        //
         // direct lighting
+        //
+        {
+            // to match passive result (note that num_scatters is already incremented)
+            float s = fmaxf(0.0f, fminf(1.0f, (num_scatters - 5) * 0.066666666666666666667f));
+            float g = (1 - s) * P.g;
+            float reduction_factor = (1 - s) + s * (1 - P.g);
 #if SPECTRAL_TRACKING
-        // reuse path and estimate for all channels
-        float3 a = Tr_spectral(boxMin,
-                               boxMax,
-                               pos,
-                               light_dir * 1e10f,
-                               inv_sigma_t,
-                               density_prime,
-                               sigma_t_spectral,
-                               rng);
-        radiance += light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+            float density_prime = reduction_factor * density;
+            float sigma_t_prime =
+                max_sigma_t * density_prime * d_max;  // max volume density is d_max
 #else
-        float a = Tr(boxMin, boxMax, pos, light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
-        radiance += light_power * (throughput * phase.evaluate(frame, light_dir) * a);
+            float sigma_t_prime = reduction_factor * sigma_t;
 #endif
+            float inv_sigma = 1.0f / sigma_t_prime;  // max volume density is d_max
+
+#if SUN_LIGHT
+#if SPECTRAL_TRACKING
+            // reuse path and estimate for all channels
+            float3 a = Tr_spectral(boxMin,
+                                   boxMax,
+                                   pos,
+                                   sun_light_dir * 1e10f,
+                                   inv_sigma,
+                                   density_prime,
+                                   sigma_t_spectral,
+                                   rng);
+            radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#else
+            float a = Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+            radiance += light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#endif
+#endif
+
+#if !(PASSIVE_ENVMAP)
+            //
+            // one sample MIS
+            //
+            constexpr float P_phase  = 0.5f;
+            constexpr float P_envmap = 1.0f - P_phase;
+            // sample by phase function
+            if (rng.next() < P_phase)
+            {
+                float u        = rng.next();
+                float v        = rng.next();
+                vec3  brdf_dir = phase.sample(frame, u, v);
+                // brdf_dir      = normalize(brdf_dir);
+
+                vec3  envc            = Envmap::eval_envmap(brdf_dir);
+                float pdf_brdf        = phase.evaluate(frame, brdf_dir);  // perfect cancellation
+                float pdf_env_virtual = Envmap::pdf_envmap(brdf_dir, envc);
+                // float weight          = MIS_power_heuristic(pdf_brdf, pdf_env_virtual) / P_phase;
+                float weight =
+                    MIS_balance_heuristic(pdf_brdf * P_phase, pdf_env_virtual * P_envmap) / P_phase;
+
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       brdf_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance += envc * (throughput /** phase.evaluate(frame, brdf_dir) / pdf_brdf*/ *
+                                    weight * a);
+#else
+                float a = Tr(boxMin, boxMax, pos, brdf_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance += envc * (throughput /** phase.evaluate(frame, brdf_dir) / pdf_brdf*/ *
+                                    weight * a);
+#endif
+            }
+            // sample by envmap pdf
+            else
+            {
+                float u = rng.next();
+                float v = rng.next();
+                vec3  envc;
+                float pdf_env = Envmap::sample_envmap(u, v, envc);
+                if (pdf_env <= 0.0f) continue;
+
+                vec3 envmap_dir = Envmap::uv_to_dir(u, v);
+                // envmap_dir      = normalize(envmap_dir);
+
+                float pdf_brdf_virtual = phase.evaluate(frame, envmap_dir);
+                // float weight           = MIS_power_heuristic(pdf_env, pdf_brdf_virtual) / (1.0f -
+                // P_phase);
+                float weight =
+                    MIS_balance_heuristic(pdf_env * P_envmap, pdf_brdf_virtual * P_phase) /
+                    P_envmap;
+
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       envmap_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance +=
+                    envc * (throughput * phase.evaluate(frame, envmap_dir) / pdf_env * weight * a);
+#else
+                float a =
+                    Tr(boxMin, boxMax, pos, envmap_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance +=
+                    envc * (throughput * phase.evaluate(frame, envmap_dir) / pdf_env * weight * a);
+#endif
+            }
+#endif
+        }
 
         // scattered direction
         float3 new_dir = normalize(phase.sample(frame, rng.next(), rng.next()));

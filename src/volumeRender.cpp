@@ -23,6 +23,7 @@ using std::endl;
 #include <thread>
 using namespace std::chrono_literals;
 
+#include "hdr/HDRloader.h"
 #include "image.h"
 #include "param.h"
 
@@ -30,8 +31,11 @@ using namespace std::chrono_literals;
 #include <load_vdb.h>
 #endif
 
-bool g_denoise = false;
 #include "denoiser.h"
+bool g_denoise = false;
+
+#include "sunsky/sky_preetham.h"
+bool g_set_sunsky = false;
 
 std::vector<Param> params;
 
@@ -119,17 +123,9 @@ extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height);
 extern "C" void free_rng();
 extern "C" void scale(float4* dst, float4* src, int size, float scale);
 extern "C" void gamma_correct(float4* dst, float4* src, int size, float scale, float gamma);
-
-namespace TextureVolume
-{
-extern "C" void init_cuda(void*         h_volume,
-                          cudaExtent    volumeSize,
-                          bool          quantized,
-                          const float3* boxmin,
-                          const float3* boxmax);
-extern "C" void set_texture_filter_mode(bool bLinearFilter);
-extern "C" void free_cuda_buffers();
-}  // namespace TextureVolume
+extern "C" void init_envmap(const float4* data, int width, int height);
+extern "C" void free_envmap();
+extern "C" void set_sun(float* sun_dir, float* sun_power);
 
 class SdkTimer
 {
@@ -220,6 +216,103 @@ public:
         mapped = false;
     }
 };
+
+class EnvMapLoader
+{
+public:
+    EnvMapLoader(const char* HDRfile, float k_brightness)
+    {
+        HDRImage HDRresult;
+
+        if (HDRLoader::load(HDRfile, HDRresult))
+            printf("HDR environment map loaded. Width: %d Height: %d\n",
+                   HDRresult.width,
+                   HDRresult.height);
+        else
+            printf("HDR environment map not found\n");
+
+        int     HDRwidth  = HDRresult.width;
+        int     HDRheight = HDRresult.height;
+        float4* cpuHDRenv = new float4[HDRwidth * HDRheight];
+
+        for (int i = 0; i < HDRwidth; i++)
+        {
+            for (int j = 0; j < HDRheight; j++)
+            {
+                int idx         = 3 * (HDRwidth * j + i);
+                int idx2        = HDRwidth * (j) + i;
+                cpuHDRenv[idx2] = make_float4(k_brightness * HDRresult.colors[idx],
+                                              k_brightness * HDRresult.colors[idx + 1],
+                                              k_brightness * HDRresult.colors[idx + 2],
+                                              0.0f);
+            }
+        }
+
+        init_envmap(cpuHDRenv, HDRwidth, HDRheight);
+        delete[] cpuHDRenv;
+    }
+
+    EnvMapLoader(const float4* data, int width, int height) { init_envmap(data, width, height); }
+
+    ~EnvMapLoader() {}
+};
+
+std::unique_ptr<EnvMapLoader> envmap;
+
+void setup_sunsky(float x, float y)
+{
+    if (y > 0.5) y = 0.5;
+
+    int                 hdrwidth = 512 * 2, hdrheight = 256 * 2;
+    std::vector<float4> hdrimage(hdrwidth * hdrheight);
+
+    PreethamSunSky s;
+    s.setSunPhi(x * M_PI * 2);
+    s.setSunTheta(y * M_PI);
+    bool            show_sun     = false;  // if include sun in the envmap
+    constexpr float sunsky_scale = 0.02;
+
+    for (int i = 0; i < hdrwidth; i++)
+    {
+        for (int j = 0; j < hdrheight; j++)
+        {
+            if (j < hdrheight / 2)
+            {
+                float phi   = float(i) / hdrwidth * 2 * M_PI;
+                float theta = (float(j) / hdrheight) * M_PI;
+                // must match Envmap::uv_to_dir
+                float3 d =
+                    make_float3(sinf(theta) * sinf(phi), cosf(theta), sinf(theta) * -cosf(phi));
+                float3 c = s.skyColor(d, show_sun);
+
+                hdrimage[i + j * hdrwidth] = make_float4(c, 1.0f) * sunsky_scale;
+            }
+            else
+            {
+                hdrimage[i + j * hdrwidth] = make_float4(0.03f, 0.03f, 0.03f, 1.0f);
+            }
+        }
+    }
+
+    envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
+
+    auto sun_dir = s.getSunDir();
+
+    float3 sun_power = make_float3(0.0f);
+    if (!show_sun) sun_power = s.sunColor() * sunsky_scale;
+    set_sun(&sun_dir.x, &sun_power.x);
+}
+
+namespace TextureVolume
+{
+extern "C" void init_cuda(void*         h_volume,
+                          cudaExtent    volumeSize,
+                          bool          quantized,
+                          const float3* boxmin,
+                          const float3* boxmax);
+extern "C" void set_texture_filter_mode(bool bLinearFilter);
+extern "C" void free_cuda_buffers();
+}  // namespace TextureVolume
 
 class CudaFrameBuffer
 {
@@ -617,6 +710,11 @@ void keyboard(unsigned char key, int x, int y)
         case 'n':
             g_denoise = !g_denoise;
 
+        case 'k':
+            g_set_sunsky = !g_set_sunsky;
+            need_reset   = true;
+            break;
+
         default:
             break;
     }
@@ -663,10 +761,17 @@ void motion(int x, int y)
     }
     else if (buttonState == 2)
     {
-        // right = zoom
-        glm::vec3 center = cam_position + cam_forward * cam_focus_dist;
-        cam_focus_dist += dy / 100.0f;
-        cam_position = center - cam_forward * cam_focus_dist;
+        if (g_set_sunsky)
+        {
+            setup_sunsky((x + 0.5f) / P.width, (y + 0.5f) / P.height);
+        }
+        else
+        {
+            // right = zoom
+            glm::vec3 center = cam_position + cam_forward * cam_focus_dist;
+            cam_focus_dist += dy / 100.0f;
+            cam_position = center - cam_forward * cam_focus_dist;
+        }
     }
     else if (buttonState == 1)
     {
@@ -722,6 +827,10 @@ void cleanup()
     free_rng();
 
     fb.reset();
+
+    envmap.reset();
+
+    free_envmap();
 
     // cudaDeviceReset causes the driver to clean up all state. While
     // not mandatory in normal operation, it is good practice.  It is also
@@ -1203,6 +1312,30 @@ int main(int argc, char** argv)
     glutIdleFunc(idle);
 
     CudaDenoiser::create_context();
+    if (0)
+    {
+        envmap = std::make_unique<EnvMapLoader>("../envmap.hdr", 1.0f);
+    }
+    else if (0)
+    {
+        int                 hdrwidth = 16, hdrheight = 8;
+        std::vector<float4> hdrimage(hdrwidth * hdrheight);
+        for (int j = 0; j < hdrheight; j++)
+        {
+            for (int i = 0; i < hdrwidth; i++)
+            {
+                hdrimage[i + j * hdrwidth] =
+                    j < 5 ? make_float4(0.03, 0.07, 0.23, 1) : make_float4(0.03, 0.03, 0.03, 1);
+            }
+        }
+        envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
+    }
+    else
+    {
+        float x = 0.5;
+        float y = 0.2;
+        setup_sunsky(x, y);
+    }
 
     fb = std::make_unique<FrameBuffer>(P.width, P.height);
     init_rng(gridSize, blockSize, P.width, P.height);
