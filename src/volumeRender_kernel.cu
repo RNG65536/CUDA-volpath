@@ -12,6 +12,8 @@
 // Configurations
 //
 
+#define BUNDLE_TEST 0
+
 // enable to add explicit directional sun light
 #define SUN_LIGHT 1
 
@@ -437,12 +439,9 @@ extern "C" void init_cuda(void*         h_volume,
     }
 
     //
-    // checkCudaErrors(cudaMemcpyToSymbol(d_volumeArray, &h_volumeArray, sizeof(d_volumeArray)));
-    // checkCudaErrors(cudaMemcpyToSymbol(d_volume_bound_array, &h_volume_bound_array,
-    // sizeof(d_volume_bound_array)));
-    checkCudaErrors(cudaMemcpyToSymbol(density_tex, &h_density_tex, sizeof(density_tex)));
-    checkCudaErrors(
-        cudaMemcpyToSymbol(density_bound_tex, &h_density_bound_tex, sizeof(density_bound_tex)));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(density_tex, &h_density_tex, sizeof(density_tex)));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(
+        density_bound_tex, &h_density_bound_tex, sizeof(density_bound_tex)));
 }
 
 extern "C" void set_texture_filter_mode(bool bLinearFilter)
@@ -460,7 +459,7 @@ extern "C" void set_texture_filter_mode(bool bLinearFilter)
             h_density_tex =
                 create_cuda_texture(h_volumeArray_f, &box_min, &box_max, bLinearFilter, true);
         }
-        checkCudaErrors(cudaMemcpyToSymbol(density_tex, &h_density_tex, sizeof(density_tex)));
+        checkCudaErrors(cudaMemcpyToSymbolAsync(density_tex, &h_density_tex, sizeof(density_tex)));
     }
 }
 
@@ -579,10 +578,10 @@ extern "C" void init_cuda(void*         h_volume,
     float3 world_to_normalized = make_float3(1.0f,
                                              (float)volumeSize.width / (float)volumeSize.height,
                                              (float)volumeSize.width / (float)volumeSize.depth);
-    checkCudaErrors(cudaMemcpyToSymbol(c_box_min, &box_min, sizeof(float3)));
-    checkCudaErrors(cudaMemcpyToSymbol(c_box_max, &box_max, sizeof(float3)));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(c_box_min, &box_min, sizeof(float3)));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(c_box_max, &box_max, sizeof(float3)));
     checkCudaErrors(
-        cudaMemcpyToSymbol(c_world_to_normalized, &world_to_normalized, sizeof(float3)));
+        cudaMemcpyToSymbolAsync(c_world_to_normalized, &world_to_normalized, sizeof(float3)));
 
 #if USE_OPENVDB
     compute_volume_bound(
@@ -923,24 +922,6 @@ __device__ float3 Trr(const float3& boxMin,
 
 namespace Envmap
 {
-template <typename T>
-struct stl_vector
-{
-    T*     _data = nullptr;
-    size_t _size = 0;
-
-    stl_vector(int size) : _size(size) { _data = new T[size]; }
-    ~stl_vector() { delete[] _data; }
-    T*       data() { return _data; }
-    const T* data() const { return _data; }
-    T&       operator[](size_t i) { return _data[i]; }
-    const T& operator[](size_t i) const { return _data[i]; }
-    T*       begin() { return _data; }
-    const T* cbegin() const { return _data; }
-    T*       end() { return _data + _size; }
-    const T* cend() const { return _data + _size; }
-};
-
 #define MULT_PDF 0
 #define PRE_WARP 1
 
@@ -1176,12 +1157,12 @@ extern "C" void init_envmap(const float4* HDRmap, int width, int height)
         envmap_width  = width;
         envmap_height = height;
 
-        checkCudaErrors(cudaMemcpyToSymbol(HDRwidth, &width, sizeof(int)));
-        checkCudaErrors(cudaMemcpyToSymbol(HDRheight, &height, sizeof(int)));
+        checkCudaErrors(cudaMemcpyToSymbolAsync(HDRwidth, &width, sizeof(int)));
+        checkCudaErrors(cudaMemcpyToSymbolAsync(HDRheight, &height, sizeof(int)));
 
         // float pdfnorm = (float)width * (float)height * M_1_TWO_PI_PI;
         float pdfnorm = (float)width * (float)height / (M_PI * TWO_PI);
-        checkCudaErrors(cudaMemcpyToSymbol(HDRpdfnorm, &pdfnorm, sizeof(float)));
+        checkCudaErrors(cudaMemcpyToSymbolAsync(HDRpdfnorm, &pdfnorm, sizeof(float)));
 
         // envmap color tex
         checkCudaErrors(cudaMallocArray(&HDRtexture_, &desc_float4, width, height));
@@ -1214,20 +1195,23 @@ extern "C" void init_envmap(const float4* HDRmap, int width, int height)
         checkCudaErrors(cudaBindTextureToArray(&EnvmapCdfX, EnvmapCdfX_, &desc_float));
 
         resized = true;
+
+        std::cout << "gpu envmap resized to " << width << " x " << height << std::endl;
     }
 
     // envmap color tex
     {
-        checkCudaErrors(cudaMemcpy2DToArray(HDRtexture_,
-                                            0,
-                                            0,
-                                            HDRmap,
-                                            sizeof(float4) * width,
-                                            sizeof(float4) * width,
-                                            height,
-                                            cudaMemcpyHostToDevice));
+        checkCudaErrors(cudaMemcpy2DToArrayAsync(HDRtexture_,
+                                                 0,
+                                                 0,
+                                                 HDRmap,
+                                                 sizeof(float4) * width,
+                                                 sizeof(float4) * width,
+                                                 height,
+                                                 cudaMemcpyHostToDevice));
     }
 
+#if BUNDLE_TEST || (!(PASSIVE_ENVMAP))
     // cdf texture
     size_t            total = size_t(width) * size_t(height);
     stl_vector<float> lum(total);
@@ -1250,7 +1234,7 @@ extern "C" void init_envmap(const float4* HDRmap, int width, int height)
     float lumsum = 0.0f;
     for (const auto& l : lum) lumsum += l;
     float pdfnormalt = (float)width * (float)height * M_1_TWO_PI_PI / lumsum;
-    checkCudaErrors(cudaMemcpyToSymbol(HDRpdfnormAlt, &pdfnormalt, sizeof(float)));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(HDRpdfnormAlt, &pdfnormalt, sizeof(float)));
 
     stl_vector<float> pdfY(height);
     stl_vector<float> cdfY(height);
@@ -1293,6 +1277,7 @@ extern "C" void init_envmap(const float4* HDRmap, int width, int height)
                                             height,
                                             cudaMemcpyHostToDevice));
     }
+#endif
 
     if (resized)
     {
@@ -1434,7 +1419,7 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
 #if PASSIVE_ENVMAP
             radiance += background(cr.d, i) * throughput;
 #else
-            if (0 == i) radiance += background(cr.d) * throughput;
+            if (0 == i) radiance += background(cr.d, i) * throughput;
 #endif
             break;
         }
@@ -1540,7 +1525,7 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
 #if PASSIVE_ENVMAP
             radiance += background(cr.d, i) * throughput;
 #else
-            if (0 == i) radiance += background(cr.d) * throughput;
+            if (0 == i) radiance += background(cr.d, i) * throughput;
 #endif
             break;
         }
@@ -1848,7 +1833,7 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
 #if PASSIVE_ENVMAP
             radiance += background(cr.d, num_scatters) * throughput;
 #else
-            if (0 == num_scatters) radiance += background(cr.d) * throughput;
+            if (0 == num_scatters) radiance += background(cr.d, num_scatters) * throughput;
 #endif
             break;
         }
@@ -2158,7 +2143,7 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
 #if PASSIVE_ENVMAP
             radiance += background(cr.d, num_scatters) * throughput;
 #else
-            if (0 == num_scatters) radiance += background(cr.d) * throughput;
+            if (0 == num_scatters) radiance += background(cr.d, num_scatters) * throughput;
 #endif
             break;
         }
@@ -2429,12 +2414,12 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
 
 extern "C" void copy_inv_view_matrix(float* invViewMatrix, size_t sizeofMatrix)
 {
-    checkCudaErrors(cudaMemcpyToSymbol(c_invViewMatrix, invViewMatrix, sizeofMatrix));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(c_invViewMatrix, invViewMatrix, sizeofMatrix));
 }
 
 extern "C" void copy_inv_model_matrix(float* invModelMatrix, size_t sizeofMatrix)
 {
-    checkCudaErrors(cudaMemcpyToSymbol(c_invModelMatrix, invModelMatrix, sizeofMatrix));
+    checkCudaErrors(cudaMemcpyToSymbolAsync(c_invModelMatrix, invModelMatrix, sizeofMatrix));
 }
 
 #if !(FAST_RNG)

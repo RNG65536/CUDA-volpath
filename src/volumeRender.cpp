@@ -35,7 +35,9 @@ using namespace std::chrono_literals;
 bool g_denoise = false;
 
 #include "sunsky/sky_preetham.h"
-bool g_set_sunsky = false;
+bool g_set_sunsky = true;
+
+bool linearFiltering = true;
 
 std::vector<Param> params;
 
@@ -54,8 +56,6 @@ void Mat(Param& P, float X, float Y, float Z, float R, float G, float B)
     P.sigma_t.z /= f;
     params.push_back(P);
 }
-
-bool linearFiltering = false;
 
 typedef unsigned int  uint;
 typedef unsigned char uchar;
@@ -231,9 +231,9 @@ public:
         else
             printf("HDR environment map not found\n");
 
-        int     HDRwidth  = HDRresult.width;
-        int     HDRheight = HDRresult.height;
-        float4* cpuHDRenv = new float4[HDRwidth * HDRheight];
+        int                HDRwidth  = HDRresult.width;
+        int                HDRheight = HDRresult.height;
+        stl_vector<float4> cpuHDRenv(HDRwidth * HDRheight);
 
         for (int i = 0; i < HDRwidth; i++)
         {
@@ -248,8 +248,7 @@ public:
             }
         }
 
-        init_envmap(cpuHDRenv, HDRwidth, HDRheight);
-        delete[] cpuHDRenv;
+        init_envmap(cpuHDRenv.data(), HDRwidth, HDRheight);
     }
 
     EnvMapLoader(const float4* data, int width, int height) { init_envmap(data, width, height); }
@@ -259,9 +258,24 @@ public:
 
 std::unique_ptr<EnvMapLoader> envmap;
 
-void setup_sunsky(float x, float y)
+float sunsky_x     = 0;
+float sunsky_y     = 0;
+float sunsky_dirty = true;
+void  setup_sunsky(float x, float y)
 {
-    if (y > 0.5) y = 0.5;
+    sunsky_x     = x;
+    sunsky_y     = y;
+    sunsky_dirty = true;
+}
+
+void update_sunsky(bool baked = false)
+{
+    if (!sunsky_dirty) return;
+
+    float x = sunsky_x;
+    float y = sunsky_y;
+    y *= 0.5f;
+    y = clamp(y, 0.0f, 0.5f);
 
     int                 hdrwidth = 512 * 2, hdrheight = 256 * 2;
     std::vector<float4> hdrimage(hdrwidth * hdrheight);
@@ -272,35 +286,40 @@ void setup_sunsky(float x, float y)
     bool            show_sun     = false;  // if include sun in the envmap
     constexpr float sunsky_scale = 0.02;
 
-    for (int i = 0; i < hdrwidth; i++)
+    if (baked)
     {
-        for (int j = 0; j < hdrheight; j++)
+        for (int i = 0; i < hdrwidth; i++)
         {
-            if (j < hdrheight / 2)
+            for (int j = 0; j < hdrheight; j++)
             {
-                float phi   = float(i) / hdrwidth * 2 * M_PI;
-                float theta = (float(j) / hdrheight) * M_PI;
-                // must match Envmap::uv_to_dir
-                float3 d =
-                    make_float3(sinf(theta) * sinf(phi), cosf(theta), sinf(theta) * -cosf(phi));
-                float3 c = s.skyColor(d, show_sun);
+                if (j < hdrheight / 2)
+                {
+                    float phi   = float(i) / hdrwidth * 2 * M_PI;
+                    float theta = (float(j) / hdrheight) * M_PI;
+                    // must match Envmap::uv_to_dir
+                    float3 d =
+                        make_float3(sinf(theta) * sinf(phi), cosf(theta), sinf(theta) * -cosf(phi));
+                    float3 c = s.skyColor(d, show_sun);
 
-                hdrimage[i + j * hdrwidth] = make_float4(c, 1.0f) * sunsky_scale;
-            }
-            else
-            {
-                hdrimage[i + j * hdrwidth] = make_float4(0.03f, 0.03f, 0.03f, 1.0f);
+                    hdrimage[i + j * hdrwidth] = make_float4(c, 1.0f) * sunsky_scale;
+                }
+                else
+                {
+                    hdrimage[i + j * hdrwidth] = make_float4(0.03f, 0.03f, 0.03f, 1.0f);
+                }
             }
         }
-    }
 
-    envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
+        envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
+    }
 
     auto sun_dir = s.getSunDir();
 
     float3 sun_power = make_float3(0.0f);
     if (!show_sun) sun_power = s.sunColor() * sunsky_scale;
     set_sun(&sun_dir.x, &sun_power.x);
+
+    sunsky_dirty = false;
 }
 
 namespace TextureVolume
@@ -571,6 +590,8 @@ void capture(bool hdr = false)
 // render image using CUDA
 void cuda_volpath()
 {
+    update_sunsky(true);
+
     if (cam_update)
     {
         cam_view = glm::lookAt(cam_position, cam_position + cam_forward * cam_focus_dist, cam_up);
@@ -709,10 +730,10 @@ void keyboard(unsigned char key, int x, int y)
 
         case 'n':
             g_denoise = !g_denoise;
+            break;
 
         case 'k':
             g_set_sunsky = !g_set_sunsky;
-            need_reset   = true;
             break;
 
         default:
@@ -755,7 +776,7 @@ void motion(int x, int y)
 
     if (buttonState == 4)
     {
-        // middle = translate
+        // right = translate
         cam_position -= cam_right * dx / 1000.0f * cam_focus_dist;
         cam_position += cam_up * dy / 1000.0f * cam_focus_dist;
     }
@@ -767,7 +788,7 @@ void motion(int x, int y)
         }
         else
         {
-            // right = zoom
+            // middle = zoom
             glm::vec3 center = cam_position + cam_forward * cam_focus_dist;
             cam_focus_dist += dy / 100.0f;
             cam_position = center - cam_forward * cam_focus_dist;
@@ -795,6 +816,17 @@ void motion(int x, int y)
     oy = y;
     glutPostRedisplay();
 
+    fb->reset();
+}
+
+void wheel(int button, int dir, int x, int y)
+{
+    glm::vec3 center = cam_position + cam_forward * cam_focus_dist;
+    cam_focus_dist += -dir / 10.0f;
+    cam_position = center - cam_forward * cam_focus_dist;
+    cam_update   = true;
+
+    glutPostRedisplay();
     fb->reset();
 }
 
@@ -1278,7 +1310,7 @@ int main(int argc, char** argv)
     int width, height, depth;
 #if USE_OPENVDB
     bool  quantized = true;  // true for uchar texture
-    char* vdb_name  = "../wdas_cloud_quarter.vdb";
+    char* vdb_name  = "../wdas_cloud_eighth.vdb";
     void* h_volume  = loadVdbFile(vdb_name, width, height, depth, quantized);
 
     float3 scale = make_float3(width, height, depth);
@@ -1309,6 +1341,7 @@ int main(int argc, char** argv)
     glutMouseFunc(mouse);
     glutMotionFunc(motion);
     glutReshapeFunc(reshape);
+    glutMouseWheelFunc(wheel);
     glutIdleFunc(idle);
 
     CudaDenoiser::create_context();

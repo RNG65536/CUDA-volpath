@@ -119,3 +119,21 @@ public:
 
     __host__ __device__ inline operator vec3() const { return vec3(x, y, z); }
 };
+
+template <typename T>
+struct stl_vector
+{
+    T*     _data = nullptr;
+    size_t _size = 0;
+
+    stl_vector(int size) : _size(size) { _data = new T[size]; }
+    ~stl_vector() { delete[] _data; }
+    T*       data() { return _data; }
+    const T* data() const { return _data; }
+    T&       operator[](size_t i) { return _data[i]; }
+    const T& operator[](size_t i) const { return _data[i]; }
+    T*       begin() { return _data; }
+    const T* cbegin() const { return _data; }
+    T*       end() { return _data + _size; }
+    const T* cend() const { return _data + _size; }
+};

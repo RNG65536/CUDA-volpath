@@ -1,10 +1,12 @@
 # CUDA-volpath
 
-CUDA based volumetric path tracing for rendering heterogeneous and chromatic volumes. Using multiple techniques to accelerate the process, including reduced scattering coefficients[1][2] and spectral tracking[3].
+CUDA based volumetric path tracing for rendering heterogeneous and chromatic volumes. Using multiple techniques to accelerate the process, including reduced scattering coefficients[1][2] and spectral and decomposition tracking[3] with local density bounds.
 
-The vdbloader utility requires installing the OpenVDB library and its dependencies, and can be used to read the volumetric cloud data from [WDAS](https://www.disneyanimation.com/data-sets/). The following render converges in several minutes.
+The vdbloader utility requires installing the OpenVDB library and its dependencies, and can be used to read the volumetric cloud data from [WDAS](https://www.disneyanimation.com/data-sets/).
 
-![](1.jpg)
+Convergence takes roughly 30 seconds on GTX 1080 with 1k samples per pixel.
+
+![](teaser.jpg)
 
 If built without OpenVDB support, a procedural Julia Set is used.
 
