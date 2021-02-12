@@ -1,6 +1,6 @@
 #pragma once
 
-#include <helper_math.h>
+#include "cuda_helpers.h"
 
 #ifdef M_PI
 #undef M_PI
@@ -137,3 +137,8 @@ struct stl_vector
     T*       end() { return _data + _size; }
     const T* cend() const { return _data + _size; }
 };
+
+__host__ __device__ inline float3 exp(const float3& a)
+{
+    return make_float3(expf(a.x), expf(a.y), expf(a.z));
+}

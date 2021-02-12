@@ -1,6 +1,6 @@
 #include "denoiser.h"
 
-#include <helper_cuda.h>
+#include "cuda_helpers.h"
 #include <optix_function_table_definition.h>  // include once in the project
 
 #include <cassert>

@@ -1,11 +1,11 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
-#include <helper_cuda.h>
-#include <helper_math.h>
 
 #include <iostream>
 
+#include "cuda_helpers.h"
 #include "param.h"
+#include "sampler.h"
 #include "vecmath.h"
 
 //
@@ -26,13 +26,16 @@
 #define MULTI_CHANNEL 0
 #define SPECTRAL_TRACKING (!(MULTI_CHANNEL))
 
+#define PRECOMPUTE_OPACITY 1
+
 // allow transforming the bounding box, but slows down the renderer
 #define USE_MODEL_TRANSFORM 0
 
-// slower, but extended with float texture support
-#define DYNAMIC_TEXTURE 0
+constexpr int max_depth = 800;
 
-#define FAST_RNG 1
+typedef unsigned int  uint;
+typedef unsigned char uchar;
+typedef unsigned char VolumeType;
 
 #if USE_OPENVDB
 uchar2* compute_volume_value_bound(const unsigned char* volume,
@@ -45,11 +48,6 @@ float2* compute_volume_value_bound(const float*      volume,
 
 using std::cout;
 using std::endl;
-
-typedef unsigned int  uint;
-typedef unsigned char uchar;
-// typedef unsigned short VolumeType;
-typedef unsigned char VolumeType;
 
 #define GetChannel(v, i) ((&(v).x)[i])
 
@@ -82,63 +80,6 @@ __device__ float avg_of(const float3& v) { return (v.x + v.y + v.z) * 0.33333333
 __device__ float sum_of(float a, float b, float c) { return (a + b + c); }
 
 __device__ float sum_of(const float3& v) { return (v.x + v.y + v.z); }
-
-#if !(FAST_RNG)
-class CudaRng
-{
-    curandStateXORWOW_t state;
-
-public:
-    __device__ void init(unsigned int seed) { curand_init(seed, 0, 0, &state); }
-
-    __device__ float next() { return curand_uniform(&state); }
-};
-#else
-__device__ unsigned int Hash(unsigned int seed)
-{
-    seed = (seed ^ 61) ^ (seed >> 16);
-    seed *= 9;
-    seed = seed ^ (seed >> 4);
-    seed *= 0x27d4eb2d;
-    seed = seed ^ (seed >> 15);
-    return seed;
-}
-
-__device__ unsigned int RngNext(unsigned int& seed_x, unsigned int& seed_y)
-{
-    unsigned int result = seed_x * 0x9e3779bb;
-
-    seed_y ^= seed_x;
-    seed_x = ((seed_x << 26) | (seed_x >> (32 - 26))) ^ seed_y ^ (seed_y << 9);
-    seed_y = (seed_x << 13) | (seed_x >> (32 - 13));
-
-    return result;
-}
-
-__device__ float Rand(unsigned int& seed_x, unsigned int& seed_y)
-{
-    unsigned int u = 0x3f800000 | (RngNext(seed_x, seed_y) >> 9);
-    return __uint_as_float(u) - 1.0;
-}
-
-class CudaRng
-{
-    unsigned int seed_x, seed_y;
-
-public:
-    __device__ void init(unsigned int pixel_x, unsigned int pixel_y, unsigned int frame_idx)
-    {
-        unsigned int s0 = (pixel_x << 16) | pixel_y;
-        unsigned int s1 = frame_idx;
-
-        seed_x = Hash(s0);
-        seed_y = Hash(s1);
-        RngNext(seed_x, seed_y);
-    }
-
-    __device__ float next() { return Rand(seed_x, seed_y); }
-};
-#endif
 
 class FractalJuliaSet
 {
@@ -198,31 +139,63 @@ public:
     }
 };
 
+struct Ray
+{
+    float3 o;  // origin
+    float3 d;  // direction
+};
+
 namespace TextureVolume
 {
 // constexpr float search_radius = 0.1f;
 constexpr float search_radius = 0.05f;  // tweak for performance
 
-#if DYNAMIC_TEXTURE
 struct CudaTexture
 {
     float3              min;
     int                 Nx;
     float3              max;
-    int                 Nxy;
+    int                 Ny;
     float3              l_inv;
-    int                 total;
+    int                 Nz;
     cudaTextureObject_t texture;
+    cudaSurfaceObject_t surface;
+
+    __device__ inline float3 normalized_coord(int i, int j, int k)
+    {
+        return make_float3((i + 0.5f) / Nx, (j + 0.5f) / Ny, (k + 0.5f) / Nz);
+    }
+
+    __device__ inline float3 to_local(const float3& pos) { return (pos - min) * l_inv; }
+
+    __device__ inline float3 to_world(const float3& posn) { return posn * (max - min) + min; }
 
     template <typename T>
-    __device__ __forceinline__ T fetch_gpu(const float3& pos) const
+    __device__ inline T sample_w(const float3& pos) const
     {
         float3 p = (pos - min) * l_inv;
         return tex3D<T>(texture, p.x, p.y, p.z);
     }
+
+    template <typename T>
+    __device__ inline T sample(const float3& p) const
+    {
+        return tex3D<T>(texture, p.x, p.y, p.z);
+    }
+
+    template <typename T>
+    __device__ inline T get_voxel(int i, int j, int k) const
+    {
+        return surf3Dread<T>(surface, (int)(i * sizeof(T)), j, k);
+    }
+
+    template <typename T>
+    __device__ void set_voxel(int i, int j, int k, const T& val)
+    {
+        surf3Dwrite(val, surface, (int)(i * sizeof(T)), j, k);
+    }
 };
 
-template <typename T>
 struct CudaArray
 {
     cudaArray_t array;
@@ -230,35 +203,6 @@ struct CudaArray
     size_t      height;
     size_t      depth;
 };
-
-template <typename T>
-CudaArray<T> create_cuda_array(T* data, int width, int height, int depth)
-{
-    CudaArray<T> a;
-
-    cudaExtent            extent  = make_cudaExtent(width, height, depth);
-    cudaChannelFormatDesc channel = cudaCreateChannelDesc<T>();
-    checkCudaErrors(cudaMalloc3DArray(&a.array, &channel, extent));
-
-    cudaMemcpy3DParms cp;
-    memset(&cp, 0, sizeof(cp));
-    cp.srcPtr   = make_cudaPitchedPtr((void*)data, width * sizeof(T), width, height);
-    cp.dstArray = a.array;
-    cp.extent   = extent;
-    cp.kind     = cudaMemcpyHostToDevice;
-    checkCudaErrors(cudaMemcpy3D(&cp));
-
-    a.width  = width;
-    a.height = width;
-    a.depth  = width;
-    return a;
-}
-
-template <typename T>
-void free_cuda_array(CudaArray<T>& array)
-{
-    checkCudaErrors(cudaFreeArray(array.array));
-}
 
 template <typename T>
 struct cudaTextureDesc get_texture_desc(bool linear_interp, bool normalized_coords);
@@ -320,7 +264,35 @@ struct cudaTextureDesc get_texture_desc<uchar2>(bool linear_interp, bool normali
 }
 
 template <typename T>
-CudaTexture create_cuda_texture(CudaArray<T>& array,
+CudaArray create_cuda_array(void* data, int width, int height, int depth)
+{
+    CudaArray a;
+
+    cudaExtent            extent  = make_cudaExtent(width, height, depth);
+    cudaChannelFormatDesc channel = cudaCreateChannelDesc<T>();
+    checkCudaErrors(cudaMalloc3DArray(&a.array, &channel, extent));
+
+    if (data)
+    {
+        cudaMemcpy3DParms cp;
+        memset(&cp, 0, sizeof(cp));
+        cp.srcPtr   = make_cudaPitchedPtr(data, width * sizeof(T), width, height);
+        cp.dstArray = a.array;
+        cp.extent   = extent;
+        cp.kind     = cudaMemcpyHostToDevice;
+        checkCudaErrors(cudaMemcpy3D(&cp));
+    }
+
+    a.width  = width;
+    a.height = height;
+    a.depth  = depth;
+    return a;
+}
+
+void free_cuda_array(CudaArray& array) { checkCudaErrors(cudaFreeArray(array.array)); }
+
+template <typename T>
+CudaTexture create_cuda_texture(CudaArray&    array,
                                 const float3* box_min           = nullptr,
                                 const float3* box_max           = nullptr,
                                 bool          linear_interp     = true,
@@ -328,7 +300,8 @@ CudaTexture create_cuda_texture(CudaArray<T>& array,
 {
     CudaTexture t;
     t.Nx  = array.width;
-    t.Nxy = array.width * array.height;
+    t.Ny  = array.height;
+    t.Nz  = array.depth;
     t.min = box_min ? *box_min
                     : make_float3(-1.0f,
                                   -(float)array.height / (float)array.width,
@@ -338,8 +311,8 @@ CudaTexture create_cuda_texture(CudaArray<T>& array,
                                   (float)array.height / (float)array.width,
                                   (float)array.depth / (float)array.width);
     t.l_inv = 1.0f / (t.max - t.min);
-    t.total = array.width * array.height * array.depth;  // note that this may overflow
 
+    // texture
     struct cudaResourceDesc res;
     memset(&res, 0, sizeof(cudaResourceDesc));
     res.resType         = cudaResourceTypeArray;
@@ -348,24 +321,30 @@ CudaTexture create_cuda_texture(CudaArray<T>& array,
     struct cudaTextureDesc tex = get_texture_desc<T>(linear_interp, normalized_coords);
 
     checkCudaErrors(cudaCreateTextureObject(&t.texture, &res, &tex, nullptr));
+
+    // surface
+    checkCudaErrors(cudaCreateSurfaceObject(&t.surface, &res));
+
     return t;
 }
 
 void free_cuda_texture(CudaTexture& texture)
 {
     checkCudaErrors(cudaDestroyTextureObject(texture.texture));
+    checkCudaErrors(cudaDestroySurfaceObject(texture.surface));
 }
 
-static CudaArray<uchar>  h_volumeArray;
-static CudaArray<uchar2> h_volume_bound_array;
-static CudaArray<float>  h_volumeArray_f;
-static CudaArray<float2> h_volume_bound_array_f;
-
-__constant__ CudaTexture density_tex;
+static CudaArray         h_volumeArray;
 static CudaTexture       h_density_tex;
+__constant__ CudaTexture density_tex;
 
-__constant__ CudaTexture density_bound_tex;
+static CudaArray         h_volume_bound_array;
 static CudaTexture       h_density_bound_tex;
+__constant__ CudaTexture density_bound_tex;
+
+static CudaArray         h_opacity_array;
+static CudaTexture       h_opacity_tex;
+__constant__ CudaTexture opacity_tex;
 
 static float3 box_min;
 static float3 box_max;
@@ -402,43 +381,39 @@ extern "C" void init_cuda(void*         h_volume,
     quantized = quantized_;
     if (quantized)
     {
-        h_volumeArray = create_cuda_array(reinterpret_cast<uchar*>(h_volume),
-                                          volumeSize.width,
-                                          volumeSize.height,
-                                          volumeSize.depth);
-        h_density_tex = create_cuda_texture(h_volumeArray, &box_min, &box_max, linear_interp, true);
+        h_volumeArray = create_cuda_array<uchar>(
+            h_volume, volumeSize.width, volumeSize.height, volumeSize.depth);
+        h_density_tex =
+            create_cuda_texture<uchar>(h_volumeArray, &box_min, &box_max, linear_interp, true);
 
         auto bound_volume = compute_volume_value_bound(
             reinterpret_cast<uchar*>(h_volume), volumeSize, search_radius);
 
-        h_volume_bound_array =
-            create_cuda_array(bound_volume, volumeSize.width, volumeSize.height, volumeSize.depth);
+        h_volume_bound_array = create_cuda_array<uchar2>(
+            bound_volume, volumeSize.width, volumeSize.height, volumeSize.depth);
         h_density_bound_tex =
-            create_cuda_texture(h_volume_bound_array, &box_min, &box_max, false, true);
+            create_cuda_texture<uchar2>(h_volume_bound_array, &box_min, &box_max, false, true);
 
         delete[] bound_volume;
     }
     else
     {
-        h_volumeArray_f = create_cuda_array(reinterpret_cast<float*>(h_volume),
-                                            volumeSize.width,
-                                            volumeSize.height,
-                                            volumeSize.depth);
+        h_volumeArray = create_cuda_array<float>(
+            h_volume, volumeSize.width, volumeSize.height, volumeSize.depth);
         h_density_tex =
-            create_cuda_texture(h_volumeArray_f, &box_min, &box_max, linear_interp, true);
+            create_cuda_texture<float>(h_volumeArray, &box_min, &box_max, linear_interp, true);
 
         auto bound_volume = compute_volume_value_bound(
             reinterpret_cast<float*>(h_volume), volumeSize, search_radius);
 
-        h_volume_bound_array_f =
-            create_cuda_array(bound_volume, volumeSize.width, volumeSize.height, volumeSize.depth);
+        h_volume_bound_array = create_cuda_array<float2>(
+            bound_volume, volumeSize.width, volumeSize.height, volumeSize.depth);
         h_density_bound_tex =
-            create_cuda_texture(h_volume_bound_array_f, &box_min, &box_max, false, true);
+            create_cuda_texture<float2>(h_volume_bound_array, &box_min, &box_max, false, true);
 
         delete[] bound_volume;
     }
 
-    //
     checkCudaErrors(cudaMemcpyToSymbolAsync(density_tex, &h_density_tex, sizeof(density_tex)));
     checkCudaErrors(cudaMemcpyToSymbolAsync(
         density_bound_tex, &h_density_bound_tex, sizeof(density_bound_tex)));
@@ -452,12 +427,12 @@ extern "C" void set_texture_filter_mode(bool bLinearFilter)
         if (quantized)
         {
             h_density_tex =
-                create_cuda_texture(h_volumeArray, &box_min, &box_max, bLinearFilter, true);
+                create_cuda_texture<uchar>(h_volumeArray, &box_min, &box_max, bLinearFilter, true);
         }
         else
         {
             h_density_tex =
-                create_cuda_texture(h_volumeArray_f, &box_min, &box_max, bLinearFilter, true);
+                create_cuda_texture<float>(h_volumeArray, &box_min, &box_max, bLinearFilter, true);
         }
         checkCudaErrors(cudaMemcpyToSymbolAsync(density_tex, &h_density_tex, sizeof(density_tex)));
     }
@@ -466,146 +441,118 @@ extern "C" void set_texture_filter_mode(bool bLinearFilter)
 extern "C" void free_cuda_buffers()
 {
     free_cuda_array(h_volumeArray);
-    free_cuda_array(h_volume_bound_array);
-    free_cuda_array(h_volumeArray_f);
-    free_cuda_array(h_volume_bound_array_f);
     free_cuda_texture(h_density_tex);
+
+    free_cuda_array(h_volume_bound_array);
     free_cuda_texture(h_density_bound_tex);
+
+    free_cuda_array(h_opacity_array);
+    free_cuda_texture(h_opacity_tex);
 }
 
+__device__ int intersect_box(
+    const Ray& r, const float3& boxmin, const float3& boxmax, float* tnear, float* tfar)
+{
+    // compute intersection of ray with all six bbox planes
+#if USE_MODEL_TRANSFORM
+    float3 invR = make_float3(1.0f) / mul(c_invModelMatrix, r.d);
+    float3 tbot = invR * (boxmin - make_float3(mul(c_invModelMatrix, make_float4(r.o, 1.0f))));
+    float3 ttop = invR * (boxmax - make_float3(mul(c_invModelMatrix, make_float4(r.o, 1.0f))));
 #else
-
-__constant__ float3 c_box_min;
-__constant__ float3 c_box_max;
-__constant__ float3 c_world_to_normalized;
-
-cudaArray*                                          d_volumeArray = 0;
-texture<VolumeType, 3, cudaReadModeNormalizedFloat> density_tex;  // 3D texture
-
-#if USE_OPENVDB
-cudaArray*                                          d_volume_bound_array = 0;
-texture<uchar2, 3, cudaReadModeNormalizedFloat>     density_bound_tex;
-
-// find volume density bound (min, max) around each voxel
-static void compute_volume_bound(const uchar*      volume,
-                                 const cudaExtent& extent,
-                                 const float3&     boxmin,
-                                 const float3&     boxmax,
-                                 const float3&     world_to_normalized)
-{
-    auto bound_volume = compute_volume_value_bound(volume, extent, search_radius);
-
-    {
-        // create 3D array
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<uchar2>();
-        checkCudaErrors(cudaMalloc3DArray(&d_volume_bound_array, &channelDesc, extent));
-
-        // copy data to 3D array
-        cudaMemcpy3DParms copyParams = {0};
-        copyParams.srcPtr            = make_cudaPitchedPtr(
-            bound_volume, extent.width * sizeof(uchar2), extent.width, extent.height);
-        copyParams.dstArray = d_volume_bound_array;
-        copyParams.extent   = extent;
-        copyParams.kind     = cudaMemcpyHostToDevice;
-        checkCudaErrors(cudaMemcpy3D(&copyParams));
-
-        // set texture parameters
-        density_bound_tex.normalized     = true;  // access with normalized texture coordinates
-        density_bound_tex.filterMode     = cudaFilterModePoint;   // linear interpolation
-        density_bound_tex.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
-        density_bound_tex.addressMode[1] = cudaAddressModeClamp;
-        density_bound_tex.addressMode[2] = cudaAddressModeClamp;
-
-        // bind array to 3D texture
-        checkCudaErrors(
-            cudaBindTextureToArray(density_bound_tex, d_volume_bound_array, channelDesc));
-    }
-
-    delete[] bound_volume;
-}
+    float3        invR = make_float3(1.0f) / r.d;
+    float3        tbot = invR * (boxmin - r.o);
+    float3        ttop = invR * (boxmax - r.o);
 #endif
 
-extern "C" void init_cuda(void*         h_volume,
-                          cudaExtent    volumeSize,
-                          bool          quantized,
-                          const float3* boxmin,
-                          const float3* boxmax)
-{
-    if (h_volume)
-    {
-        // create 3D array
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<VolumeType>();
-        checkCudaErrors(cudaMalloc3DArray(&d_volumeArray, &channelDesc, volumeSize));
+    // re-order intersections to find smallest and largest on each axis
+    float3 tmin = fminf(ttop, tbot);
+    float3 tmax = fmaxf(ttop, tbot);
 
-        // copy data to 3D array
-        cudaMemcpy3DParms copyParams = {0};
-        copyParams.srcPtr            = make_cudaPitchedPtr(
-            h_volume, volumeSize.width * sizeof(VolumeType), volumeSize.width, volumeSize.height);
-        copyParams.dstArray = d_volumeArray;
-        copyParams.extent   = volumeSize;
-        copyParams.kind     = cudaMemcpyHostToDevice;
-        checkCudaErrors(cudaMemcpy3D(&copyParams));
+    // find the largest tmin and the smallest tmax
+    float largest_tmin  = max_of(tmin);
+    float smallest_tmax = min_of(tmax);
 
-        // set texture parameters
-        density_tex.normalized     = true;  // access with normalized texture coordinates
-        density_tex.filterMode     = cudaFilterModeLinear;  // linear interpolation
-        density_tex.addressMode[0] = cudaAddressModeClamp;  // clamp texture coordinates
-        density_tex.addressMode[1] = cudaAddressModeClamp;
-        density_tex.addressMode[2] = cudaAddressModeClamp;
+    *tnear = largest_tmin;
+    *tfar  = smallest_tmax;
 
-        // bind array to 3D texture
-        checkCudaErrors(cudaBindTextureToArray(density_tex, d_volumeArray, channelDesc));
-    }
+    if (*tnear <= 0) *tnear = 0;
 
-    //
-    float3 box_min;
-    float3 box_max;
-    if (boxmin && boxmax)
-    {
-        box_min = *boxmin;
-        box_max = *boxmax;
-    }
-    else
-    {
-        box_min = make_float3(-1.0f,
-                              -(float)volumeSize.height / (float)volumeSize.width,
-                              -(float)volumeSize.depth / (float)volumeSize.width);
-        box_max = make_float3(1.0f,
-                              (float)volumeSize.height / (float)volumeSize.width,
-                              (float)volumeSize.depth / (float)volumeSize.width);
-    }
-
-    float3 world_to_normalized = make_float3(1.0f,
-                                             (float)volumeSize.width / (float)volumeSize.height,
-                                             (float)volumeSize.width / (float)volumeSize.depth);
-    checkCudaErrors(cudaMemcpyToSymbolAsync(c_box_min, &box_min, sizeof(float3)));
-    checkCudaErrors(cudaMemcpyToSymbolAsync(c_box_max, &box_max, sizeof(float3)));
-    checkCudaErrors(
-        cudaMemcpyToSymbolAsync(c_world_to_normalized, &world_to_normalized, sizeof(float3)));
-
-#if USE_OPENVDB
-    compute_volume_bound(
-        reinterpret_cast<uchar*>(h_volume), volumeSize, box_min, box_max, world_to_normalized);
-#endif
+    return smallest_tmax > largest_tmin && smallest_tmax >= 1e-3f;
 }
 
-extern "C" void set_texture_filter_mode(bool bLinearFilter)
+__global__ void _precompute_opacity(float3 light_dir, int width, int height, int depth)
 {
-    density_tex.filterMode = bLinearFilter ? cudaFilterModeLinear : cudaFilterModePoint;
+    int i = threadIdx.x + blockIdx.x * blockDim.x;
+    int j = threadIdx.y + blockIdx.y * blockDim.y;
+    int k = threadIdx.z + blockIdx.z * blockDim.z;
+
+    float x = (i + 0.5f) / width;
+    float y = (j + 0.5f) / height;
+    float z = (k + 0.5f) / depth;
+
+    // do not update the boundary
+    int nx = opacity_tex.Nx;
+    int ny = opacity_tex.Ny;
+    int nz = opacity_tex.Nz;
+    if (i < 0 || i >= nx || j < 0 || j >= ny || k < 0 || k >= nz) return;
+
+    constexpr float dt = 0.001f;
+
+    float3 start0 = opacity_tex.normalized_coord(i, j, k);
+    float3 start  = opacity_tex.to_world(start0);
+
+    Ray shadow_ray;
+    shadow_ray.o = start;
+    shadow_ray.d = light_dir;
+
+    float tNear, tFar;
+    bool  hit = intersect_box(shadow_ray, opacity_tex.min, opacity_tex.max, &tNear, &tFar);
+
+    float opacity = 0.0f;
+    if (hit)
+    {
+        for (float t = tNear; t < tFar; t += dt)
+        {
+            float3 pos           = shadow_ray.o + shadow_ray.d * t;
+            float  local_density = density_tex.sample_w<float>(pos);
+            opacity += local_density;
+        }
+        opacity *= dt;
+    }
+
+    opacity_tex.set_voxel(i, j, k, opacity);
 }
 
-extern "C" void free_cuda_buffers()
+extern "C" void precompute_opacity(const float* light_dir)
 {
-    checkCudaErrors(cudaFreeArray(d_volumeArray));
-#if USE_OPENVDB
-    checkCudaErrors(cudaFreeArray(d_volume_bound_array));
+#if PRECOMPUTE_OPACITY
+    static bool initialized = false;
+    if (initialized)
+    {
+        free_cuda_array(h_opacity_array);
+        free_cuda_texture(h_opacity_tex);
+    }
+    initialized = true;
+
+    int width       = h_volumeArray.width;
+    int height      = h_volumeArray.height;
+    int depth       = h_volumeArray.depth;
+    h_opacity_array = create_cuda_array<float>(nullptr, width, height, depth);
+    h_opacity_tex   = create_cuda_texture<float>(
+        h_opacity_array, &h_density_tex.min, &h_density_tex.max, true, true);
+
+    checkCudaErrors(cudaMemcpyToSymbolAsync(opacity_tex, &h_opacity_tex, sizeof(opacity_tex)));
+
+    dim3   block_size(8, 8, 8);
+    dim3   grid_size(divideUp(width, block_size.x),
+                   divideUp(height, block_size.y),
+                   divideUp(depth, block_size.z));
+    float3 dir = make_float3(light_dir[0], light_dir[1], light_dir[2]);
+    _precompute_opacity<<<grid_size, block_size>>>(dir, width, height, depth);
 #endif
 }
-#endif
 
 }  // namespace TextureVolume
-
-CudaRng* cuda_rng = nullptr;
 
 class Frame
 {
@@ -680,12 +627,6 @@ __constant__ float3x4 c_invViewMatrix;  // inverse view matrix
 
 __constant__ float3x4 c_invModelMatrix;  // inverse model matrix
 
-struct Ray
-{
-    float3 o;  // origin
-    float3 d;  // direction
-};
-
 // transform vector by matrix (no translation)
 __device__ float3 mul(const float3x4& M, const float3& v)
 {
@@ -711,7 +652,7 @@ __device__ float4 mul(const float3x4& M, const float4& v)
 // http://www.siggraph.org/education/materials/HyperGraph/raytrace/rtinter3.htm
 
 __device__ int intersectBox(
-    Ray r, const float3& boxmin, const float3& boxmax, float* tnear, float* tfar)
+    const Ray& r, const float3& boxmin, const float3& boxmax, float* tnear, float* tfar)
 {
     // compute intersection of ray with all six bbox planes
 #if USE_MODEL_TRANSFORM
@@ -747,23 +688,11 @@ __device__ float vol_sigma_t(const float3& pos_, float density)
 #endif
 
 #if USE_OPENVDB
-#if DYNAMIC_TEXTURE
     // use world position for access
-    float t = TextureVolume::density_tex.fetch_gpu<float>(pos);
+    float t = TextureVolume::density_tex.sample_w<float>(pos);
     // t           = clamp(t, 0.0f, 1.0f) * density;
     t *= density;
     return t;
-#else
-    // remap position to [0, 1] coordinates
-    float3 posn = pos * TextureVolume::c_world_to_normalized;
-    float  t    = tex3D(TextureVolume::density_tex,
-                    posn.x * 0.5f + 0.5f,
-                    posn.y * 0.5f + 0.5f,
-                    posn.z * 0.5f + 0.5f);
-    // t           = clamp(t, 0.0f, 1.0f) * density;
-    t *= density;
-    return t;
-#endif
 #elif 0
     float         x    = pos.x * 0.5f + 0.5f;
     float         y    = pos.y * 0.5f + 0.5f;
@@ -779,6 +708,7 @@ __device__ float vol_sigma_t(const float3& pos_, float density)
 }
 
 // transmittance estimation by delta tracking
+// TODO : correction for anisotropic scattering
 __device__ float Tr(const float3& boxMin,
                     const float3& boxMax,
                     const float3& start_point,
@@ -1352,31 +1282,22 @@ extern "C" void set_sun(float* sun_dir, float* sun_power)
     checkCudaErrors(cudaMemcpyToSymbolAsync(sun_light_power, &p.x, sizeof(float3)));
 }
 
-__global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
+__global__ void __d_render(float4* d_output, int spp, const Param P)
 {
     const float  density    = P.density;
     const float  brightness = P.brightness;
     const float3 albedo     = P.albedo;
 
-#if DYNAMIC_TEXTURE
     const float3& boxMin = TextureVolume::density_tex.min;
     const float3& boxMax = TextureVolume::density_tex.max;
-#else
-    const float3& boxMin = TextureVolume::c_box_min;
-    const float3& boxMax = TextureVolume::c_box_max;
-#endif
 
     uint x = blockIdx.x * blockDim.x + threadIdx.x;
     uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if ((x >= P.width) || (y >= P.height)) return;
 
-#if !(FAST_RNG)
-    CudaRng& rng = rngs[x + y * P.width];
-#else
-    CudaRng       rng;
-    rng.init(x, y, (int)rngs);
-#endif
+    CudaRng rng;
+    rng.init(x, y, spp);
 
     // float    u   = (x * 2.0f - P.width) / P.height;
     // float    v   = (y * 2.0f - P.height) / P.height;
@@ -1408,7 +1329,7 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
 #endif
 
     int i;
-    for (i = 0; i < 10000; i++)
+    for (i = 0; i < max_depth; i++)
     {
         // find intersection with box
         float t_near, t_far;
@@ -1566,7 +1487,7 @@ __global__ void __d_render(float4* d_output, CudaRng* rngs, const Param P)
             radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
 #else
             float a = Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
-            radiance += light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+            radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
 #endif
 #endif
 
@@ -1678,20 +1599,9 @@ __device__ float vol_bound(const float3& pos_)
 #endif
 
 #if USE_OPENVDB
-#if DYNAMIC_TEXTURE
     // use world position for access
-    float t = TextureVolume::density_bound_tex.fetch_gpu<float2>(pos).x;
+    float t = TextureVolume::density_bound_tex.sample_w<float2>(pos).x;
     return t;
-#else
-    // remap position to [0, 1] coordinates
-    float3 posn = pos * TextureVolume::c_world_to_normalized;
-    float  t    = tex3D(TextureVolume::density_bound_tex,
-                    posn.x * 0.5f + 0.5f,
-                    posn.y * 0.5f + 0.5f,
-                    posn.z * 0.5f + 0.5f)
-                  .x;
-    return t;
-#endif
 #else
     return 1.0f;
 #endif
@@ -1706,17 +1616,8 @@ __device__ float2 vol_bound_minmax(const float3& pos_)
 #endif
 
 #if USE_OPENVDB
-#if DYNAMIC_TEXTURE
     // use world position for access
-    return TextureVolume::density_bound_tex.fetch_gpu<float2>(pos);
-#else
-    // remap position to [0, 1] coordinates
-    float3 posn = pos * TextureVolume::c_world_to_normalized;
-    return tex3D(TextureVolume::density_bound_tex,
-                 posn.x * 0.5f + 0.5f,
-                 posn.y * 0.5f + 0.5f,
-                 posn.z * 0.5f + 0.5f);
-#endif
+    return TextureVolume::density_bound_tex.sample_w<float2>(pos);
 #else
     return make_float2(1.0f, 0.0f);  // max, min
 #endif
@@ -1736,9 +1637,9 @@ __device__ int intersectSuperVolume(Ray           r,
     float3 tbot = invR * (boxmin - make_float3(mul(c_invModelMatrix, make_float4(r.o, 1.0f))));
     float3 ttop = invR * (boxmax - make_float3(mul(c_invModelMatrix, make_float4(r.o, 1.0f))));
 #else
-    float3        invR   = make_float3(1.0f) / r.d;
-    float3        tbot   = invR * (boxmin - r.o);
-    float3        ttop   = invR * (boxmax - r.o);
+    float3 invR             = make_float3(1.0f) / r.d;
+    float3 tbot             = invR * (boxmin - r.o);
+    float3 ttop             = invR * (boxmax - r.o);
 #endif
 
     // re-order intersections to find smallest and largest on each axis
@@ -1763,31 +1664,22 @@ __device__ int intersectSuperVolume(Ray           r,
 // if each TextureVolume::search_radius track length is exceeded
 // the tracker is restarted with modified ray origin only
 // and for each track a local max density is used to boost the mean free path
-__global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param P)
+__global__ void __d_render_bounded(float4* d_output, int spp, const Param P)
 {
     const float  density    = P.density;
     const float  brightness = P.brightness;
     const float3 albedo     = P.albedo;
 
-#if DYNAMIC_TEXTURE
     const float3& boxMin = TextureVolume::density_tex.min;
     const float3& boxMax = TextureVolume::density_tex.max;
-#else
-    const float3& boxMin = TextureVolume::c_box_min;
-    const float3& boxMax = TextureVolume::c_box_max;
-#endif
 
     uint x = blockIdx.x * blockDim.x + threadIdx.x;
     uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if ((x >= P.width) || (y >= P.height)) return;
 
-#if !(FAST_RNG)
-    CudaRng& rng = rngs[x + y * P.width];
-#else
-    CudaRng       rng;
-    rng.init(x, y, (int)rngs);
-#endif
+    CudaRng rng;
+    rng.init(x, y, spp);
 
     // float    u   = (x * 2.0f - P.width) / P.height;
     // float    v   = (y * 2.0f - P.height) / P.height;
@@ -1821,7 +1713,7 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
     int num_scatters = 0;
 
     int i;
-    for (i = 0; i < 10000; i++)
+    for (i = 0; i < max_depth; i++)
     {
         // find intersection with box
         float t_near, t_far;
@@ -1956,7 +1848,7 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
             radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
 #else
             float a = Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
-            radiance += light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+            radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
 #endif
 #endif
 
@@ -2063,31 +1955,22 @@ __global__ void __d_render_bounded(float4* d_output, CudaRng* rngs, const Param 
 // if each TextureVolume::search_radius track length is exceeded
 // the tracker is restarted with modified ray origin only
 // and for each track a local max density is used to boost the mean free path
-__global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const Param P)
+__global__ void __d_render_bounded_decomp(float4* d_output, int spp, const Param P)
 {
     const float  density    = P.density;
     const float  brightness = P.brightness;
     const float3 albedo     = P.albedo;
 
-#if DYNAMIC_TEXTURE
     const float3& boxMin = TextureVolume::density_tex.min;
     const float3& boxMax = TextureVolume::density_tex.max;
-#else
-    const float3& boxMin = TextureVolume::c_box_min;
-    const float3& boxMax = TextureVolume::c_box_max;
-#endif
 
     uint x = blockIdx.x * blockDim.x + threadIdx.x;
     uint y = blockIdx.y * blockDim.y + threadIdx.y;
 
     if ((x >= P.width) || (y >= P.height)) return;
 
-#if !(FAST_RNG)
-    CudaRng& rng = rngs[x + y * P.width];
-#else
-    CudaRng       rng;
-    rng.init(x, y, (int)rngs);
-#endif
+    CudaRng rng;
+    rng.init(x, y, spp);
 
     // float    u   = (x * 2.0f - P.width) / P.height;
     // float    v   = (y * 2.0f - P.height) / P.height;
@@ -2129,7 +2012,7 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
 
     int num_scatters = 0;
 
-    while (num_scatters < 10000)
+    while (num_scatters < max_depth)
     {
         // find intersection with box
         float t_near, t_far;
@@ -2295,21 +2178,43 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
             float inv_sigma = 1.0f / sigma_t_prime;  // max volume density is d_max
 
 #if SUN_LIGHT
+#if PRECOMPUTE_OPACITY
+            // precomputed opacity use condition
+            if (spp > 10 && num_scatters > 20)
+            {
 #if SPECTRAL_TRACKING
-            // reuse path and estimate for all channels
-            float3 a = Tr_spectral(boxMin,
-                                   boxMax,
-                                   pos,
-                                   sun_light_dir * 1e10f,
-                                   inv_sigma,
-                                   density_prime,
-                                   sigma_t_spectral,
-                                   rng);
-            radiance += sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+                float3 a = exp(-sigma_t_spectral * density_prime *
+                               TextureVolume::opacity_tex.sample_w<float>(pos));
+                radiance +=
+                    sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
 #else
-            float a = Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
-            radiance += light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+                float a = exp(-sigma_t_prime * TextureVolume::opacity_tex.sample_w<float>(pos));
+                radiance +=
+                    sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
 #endif
+            }
+            else
+#endif
+            {
+#if SPECTRAL_TRACKING
+                // reuse path and estimate for all channels
+                float3 a = Tr_spectral(boxMin,
+                                       boxMax,
+                                       pos,
+                                       sun_light_dir * 1e10f,
+                                       inv_sigma,
+                                       density_prime,
+                                       sigma_t_spectral,
+                                       rng);
+                radiance +=
+                    sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#else
+                float a =
+                    Tr(boxMin, boxMax, pos, sun_light_dir * 1e10f, inv_sigma, sigma_t_prime, rng);
+                radiance +=
+                    sun_light_power * (throughput * phase.evaluate(frame, sun_light_dir) * a);
+#endif
+            }
 #endif
 
 #if !(PASSIVE_ENVMAP)
@@ -2401,7 +2306,7 @@ __global__ void __d_render_bounded_decomp(float4* d_output, CudaRng* rngs, const
     radiance *= brightness;
 
     // write output color
-    float heat = num_scatters * 0.001;
+    float heat = num_scatters;
 #if MULTI_CHANNEL
     float4 color               = make_float4(0.0f, 0.0f, 0.0f, heat);
     GetChannel(color, channel) = fmaxf(GetChannel(radiance, channel), 0.0f) * 3.0f;
@@ -2422,68 +2327,8 @@ extern "C" void copy_inv_model_matrix(float* invModelMatrix, size_t sizeofMatrix
     checkCudaErrors(cudaMemcpyToSymbolAsync(c_invModelMatrix, invModelMatrix, sizeofMatrix));
 }
 
-#if !(FAST_RNG)
-namespace XORShift
-{
-// XOR shift PRNG
-unsigned int        x = 123456789;
-unsigned int        y = 362436069;
-unsigned int        z = 521288629;
-unsigned int        w = 88675123;
-inline unsigned int frand()
-{
-    unsigned int t;
-    t = x ^ (x << 11);
-    x = y;
-    y = z;
-    z = w;
-    return (w = (w ^ (w >> 19)) ^ (t ^ (t >> 8)));
-}
-}  // namespace XORShift
-
-__global__ void __init_rng(CudaRng* rng, int width, int height, unsigned int* seeds)
-{
-    uint x = blockIdx.x * blockDim.x + threadIdx.x;
-    uint y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if ((x >= width) || (y >= height))
-    {
-        return;
-    }
-
-    int idx = x + y * width;
-    rng[idx].init(seeds[idx]);
-}
-
-extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height)
-{
-    cout << "init cuda rng to " << width << " x " << height << endl;
-    unsigned int* seeds;
-    checkCudaErrors(cudaMalloc(&seeds, sizeof(unsigned int) * width * height));
-
-    unsigned int* h_seeds = new unsigned int[width * height];
-    for (int i = 0; i < width * height; ++i)
-    {
-        h_seeds[i] = XORShift::frand();
-    }
-    checkCudaErrors(
-        cudaMemcpy(seeds, h_seeds, sizeof(unsigned int) * width * height, cudaMemcpyHostToDevice));
-    delete h_seeds;
-
-    checkCudaErrors(cudaMalloc(&cuda_rng, sizeof(CudaRng) * width * height));
-    __init_rng<<<gridSize, blockSize>>>(cuda_rng, width, height, seeds);
-    checkCudaErrors(cudaFree(seeds));
-}
-
-extern "C" void free_rng()
-{
-    cout << "free cuda rng" << endl;
-    checkCudaErrors(cudaFree(cuda_rng));
-}
-#else
 extern "C" void init_rng(dim3 gridSize, dim3 blockSize, int width, int height) {}
 extern "C" void free_rng() {}
-#endif
 
 __global__ void __scale(float4* dst, float4* src, int size, float scale)
 {
@@ -2519,11 +2364,7 @@ extern "C" void gamma_correct(float4* dst, float4* src, int size, float scale, f
 extern "C" void render_kernel(
     dim3 gridSize, dim3 blockSize, float4* d_output, int spp, const Param& p)
 {
-#if FAST_RNG
-    cuda_rng = (CudaRng*)spp;
-#endif
-
-    //__d_render<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
-    //__d_render_bounded<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
-    __d_render_bounded_decomp<<<gridSize, blockSize>>>(d_output, cuda_rng, p);
+    //__d_render<<<gridSize, blockSize>>>(d_output, spp, p);
+    //__d_render_bounded<<<gridSize, blockSize>>>(d_output, spp, p);
+    __d_render_bounded_decomp<<<gridSize, blockSize>>>(d_output, spp, p);
 }

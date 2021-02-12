@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 11)
 
 enable_language(CUDA)
 find_package(CUDA REQUIRED)
-include_directories($ENV{NVCUDASAMPLES_ROOT}/common/inc)
+#include_directories($ENV{NVCUDASAMPLES_ROOT}/common/inc)
 
 find_package(openmp QUIET)
 if (OPENMP_FOUND)

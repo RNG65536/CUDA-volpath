@@ -11,9 +11,6 @@ using std::endl;
 #include <GL/freeglut.h>
 #include <cuda_gl_interop.h>
 #include <cuda_runtime.h>
-#include <helper_cuda.h>
-#include <helper_math.h>
-#include <helper_timer.h>
 #include <vector_functions.h>
 #include <vector_types.h>
 
@@ -21,6 +18,8 @@ using std::endl;
 #include <deque>
 #include <random>
 #include <thread>
+
+#include "cuda_helpers.h"
 using namespace std::chrono_literals;
 
 #include "hdr/HDRloader.h"
@@ -126,6 +125,7 @@ extern "C" void gamma_correct(float4* dst, float4* src, int size, float scale, f
 extern "C" void init_envmap(const float4* data, int width, int height);
 extern "C" void free_envmap();
 extern "C" void set_sun(float* sun_dir, float* sun_power);
+extern "C" void precompute_opacity(const float* light_dir);
 
 class SdkTimer
 {
@@ -258,68 +258,83 @@ public:
 
 std::unique_ptr<EnvMapLoader> envmap;
 
-float sunsky_x     = 0;
-float sunsky_y     = 0;
-float sunsky_dirty = true;
-void  setup_sunsky(float x, float y)
+float          sunsky_x      = 0;
+float          sunsky_y      = 0;
+float          sunsky_dirty  = false;
+float          opacity_dirty = false;
+PreethamSunSky s;
+
+void setup_sunsky(float x, float y)
 {
-    sunsky_x     = x;
-    sunsky_y     = y;
-    sunsky_dirty = true;
+    sunsky_x      = x;
+    sunsky_y      = y;
+    sunsky_dirty  = true;
+    opacity_dirty = true;
 }
 
-void update_sunsky(bool baked = false)
+void update_sunsky(int spp, bool baked = false)
 {
-    if (!sunsky_dirty) return;
-
-    float x = sunsky_x;
-    float y = sunsky_y;
-    y *= 0.5f;
-    y = clamp(y, 0.0f, 0.5f);
-
-    int                 hdrwidth = 512 * 2, hdrheight = 256 * 2;
-    std::vector<float4> hdrimage(hdrwidth * hdrheight);
-
-    PreethamSunSky s;
-    s.setSunPhi(x * M_PI * 2);
-    s.setSunTheta(y * M_PI);
-    bool            show_sun     = false;  // if include sun in the envmap
-    constexpr float sunsky_scale = 0.02;
-
-    if (baked)
+    if (sunsky_dirty)
     {
-        for (int i = 0; i < hdrwidth; i++)
-        {
-            for (int j = 0; j < hdrheight; j++)
-            {
-                if (j < hdrheight / 2)
-                {
-                    float phi   = float(i) / hdrwidth * 2 * M_PI;
-                    float theta = (float(j) / hdrheight) * M_PI;
-                    // must match Envmap::uv_to_dir
-                    float3 d =
-                        make_float3(sinf(theta) * sinf(phi), cosf(theta), sinf(theta) * -cosf(phi));
-                    float3 c = s.skyColor(d, show_sun);
+        float x = sunsky_x;
+        float y = sunsky_y;
+        y *= 0.5f;
+        y = clamp(y, 0.0f, 0.5f);
 
-                    hdrimage[i + j * hdrwidth] = make_float4(c, 1.0f) * sunsky_scale;
-                }
-                else
+        int                 hdrwidth = 512 * 2, hdrheight = 256 * 2;
+        std::vector<float4> hdrimage(hdrwidth * hdrheight);
+
+        s.setSunPhi(x * M_PI * 2);
+        s.setSunTheta(y * M_PI);
+        bool            show_sun     = false;  // if include sun in the envmap
+        constexpr float sunsky_scale = 0.02;
+
+        if (baked)
+        {
+            for (int i = 0; i < hdrwidth; i++)
+            {
+                for (int j = 0; j < hdrheight; j++)
                 {
-                    hdrimage[i + j * hdrwidth] = make_float4(0.03f, 0.03f, 0.03f, 1.0f);
+                    if (j < hdrheight / 2)
+                    {
+                        float phi   = float(i) / hdrwidth * 2 * M_PI;
+                        float theta = (float(j) / hdrheight) * M_PI;
+                        // must match Envmap::uv_to_dir
+                        float3 d = make_float3(
+                            sinf(theta) * sinf(phi), cosf(theta), sinf(theta) * -cosf(phi));
+                        float3 c = s.skyColor(d, show_sun);
+
+                        hdrimage[i + j * hdrwidth] = make_float4(c, 1.0f) * sunsky_scale;
+                    }
+                    else
+                    {
+                        hdrimage[i + j * hdrwidth] = make_float4(0.03f, 0.03f, 0.03f, 1.0f);
+                    }
                 }
             }
+
+            envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
         }
 
-        envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
+        auto sun_dir = s.getSunDir();
+
+        float3 sun_power = make_float3(0.0f);
+        if (!show_sun) sun_power = s.sunColor() * sunsky_scale;
+        set_sun(&sun_dir.x, &sun_power.x);
+
+        sunsky_dirty = false;
     }
 
-    auto sun_dir = s.getSunDir();
-
-    float3 sun_power = make_float3(0.0f);
-    if (!show_sun) sun_power = s.sunColor() * sunsky_scale;
-    set_sun(&sun_dir.x, &sun_power.x);
-
-    sunsky_dirty = false;
+    // precomputed opacity use condition
+    if (spp > 10)
+    {
+        if (opacity_dirty)
+        {
+            auto sun_dir = s.getSunDir();
+            precompute_opacity(&sun_dir.x);
+            opacity_dirty = false;
+        }
+    }
 }
 
 namespace TextureVolume
@@ -590,7 +605,7 @@ void capture(bool hdr = false)
 // render image using CUDA
 void cuda_volpath()
 {
-    update_sunsky(true);
+    update_sunsky(fb->samplesPerPixel(), true);
 
     if (cam_update)
     {
@@ -829,8 +844,6 @@ void wheel(int button, int dir, int x, int y)
     glutPostRedisplay();
     fb->reset();
 }
-
-int divideUp(int a, int b) { return (a + b - 1) / b; }
 
 void reshape(int w, int h)
 {
