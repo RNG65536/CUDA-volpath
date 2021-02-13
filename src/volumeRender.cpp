@@ -33,7 +33,7 @@ using namespace std::chrono_literals;
 #include "denoiser.h"
 bool g_denoise = false;
 
-#include "sunsky/sky_preetham.h"
+#include "sunsky/sunsky.h"
 bool g_set_sunsky = true;
 
 bool linearFiltering = true;
@@ -258,11 +258,12 @@ public:
 
 std::unique_ptr<EnvMapLoader> envmap;
 
-float          sunsky_x      = 0;
-float          sunsky_y      = 0;
-float          sunsky_dirty  = false;
-float          opacity_dirty = false;
-PreethamSunSky s;
+float sunsky_x      = 0;
+float sunsky_y      = 0;
+float sunsky_dirty  = false;
+float opacity_dirty = false;
+// SkyModel<PreethamSunSky> s;
+SkyModel<Tungsten::Skydome> s;
 
 void setup_sunsky(float x, float y)
 {
@@ -279,18 +280,23 @@ void update_sunsky(int spp, bool baked = false)
         float x = sunsky_x;
         float y = sunsky_y;
         y *= 0.5f;
-        y = clamp(y, 0.0f, 0.5f);
+        y = clamp(y, 0.0f, 0.49999f);
 
         int                 hdrwidth = 512 * 2, hdrheight = 256 * 2;
         std::vector<float4> hdrimage(hdrwidth * hdrheight);
 
         s.setSunPhi(x * M_PI * 2);
         s.setSunTheta(y * M_PI);
-        bool            show_sun     = false;  // if include sun in the envmap
+
+        bool            bake_sun     = false;  // if include sun in the envmap
         constexpr float sunsky_scale = 0.02;
+
+        auto sun_dir   = s.getSunDir();
+        auto sun_power = s.sunColor() * sunsky_scale;
 
         if (baked)
         {
+#pragma omp parallel for
             for (int i = 0; i < hdrwidth; i++)
             {
                 for (int j = 0; j < hdrheight; j++)
@@ -302,13 +308,16 @@ void update_sunsky(int spp, bool baked = false)
                         // must match Envmap::uv_to_dir
                         float3 d = make_float3(
                             sinf(theta) * sinf(phi), cosf(theta), sinf(theta) * -cosf(phi));
-                        float3 c = s.skyColor(d, show_sun);
+                        float3 c = s.skyColor(d, bake_sun);
 
                         hdrimage[i + j * hdrwidth] = make_float4(c, 1.0f) * sunsky_scale;
                     }
                     else
                     {
-                        hdrimage[i + j * hdrwidth] = make_float4(0.03f, 0.03f, 0.03f, 1.0f);
+                        float3 ground_albedo      = make_float3(0.01f);
+                        float3 reflected_radiance = ground_albedo * sun_dir.y * sun_power *
+                                                    (M_PI * (0.45 / 94.0f * 0.45 / 94.0f));
+                        hdrimage[i + j * hdrwidth] = make_float4(reflected_radiance, 1.0f);
                     }
                 }
             }
@@ -316,10 +325,8 @@ void update_sunsky(int spp, bool baked = false)
             envmap = std::make_unique<EnvMapLoader>(hdrimage.data(), hdrwidth, hdrheight);
         }
 
-        auto sun_dir = s.getSunDir();
-
-        float3 sun_power = make_float3(0.0f);
-        if (!show_sun) sun_power = s.sunColor() * sunsky_scale;
+        if (bake_sun) sun_power = make_float3(0.0f);
+        printf("sun power = %f, %f, %f\n", sun_power.x, sun_power.y, sun_power.z);
         set_sun(&sun_dir.x, &sun_power.x);
 
         sunsky_dirty = false;
